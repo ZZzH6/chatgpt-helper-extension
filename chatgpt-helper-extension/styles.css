@@ -1,0 +1,174 @@
+#cgh-panel {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483647;
+  width: 280px;
+  background: rgba(17, 24, 39, 0.95);
+  color: #f9fafb;
+  border-radius: 14px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+  padding: 12px 12px 10px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  backdrop-filter: blur(8px);
+}
+
+#cgh-panel * {
+  box-sizing: border-box;
+}
+
+#cgh-panel.cgh-hidden {
+  opacity: 0.12;
+}
+
+#cgh-panel .cgh-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+#cgh-panel .cgh-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+#cgh-panel .cgh-mini-btn {
+  border: 0;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: #111827;
+  background: #e5e7eb;
+}
+
+#cgh-panel .cgh-main {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+#cgh-panel .cgh-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 62px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+#cgh-panel .cgh-ok { background: #064e3b; color: #d1fae5; }
+#cgh-panel .cgh-warn { background: #78350f; color: #fde68a; }
+#cgh-panel .cgh-danger { background: #7f1d1d; color: #fecaca; }
+
+#cgh-panel .cgh-list {
+  margin-top: 8px;
+  max-height: 190px;
+  overflow: auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  padding-top: 8px;
+}
+
+#cgh-panel .cgh-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: start;
+  font-size: 11px;
+  padding: 4px 0;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+}
+
+#cgh-panel .cgh-item:last-child {
+  border-bottom: 0;
+}
+
+#cgh-panel .cgh-role {
+  min-width: 28px;
+  opacity: 0.7;
+}
+
+#cgh-panel .cgh-preview {
+  opacity: 0.9;
+  word-break: break-word;
+}
+
+#cgh-panel .cgh-token {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+#cgh-formula-btn,
+#cgh-formula-menu button {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#cgh-formula-btn {
+  position: fixed;
+  z-index: 2147483646;
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  color: white;
+  background: rgba(17, 24, 39, 0.9);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  user-select: none;
+  white-space: nowrap;
+  display: none;
+}
+
+#cgh-formula-btn:hover {
+  background: rgba(17, 24, 39, 0.98);
+}
+
+#cgh-formula-menu {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 160px;
+  max-width: min(220px, calc(100vw - 16px));
+  border-radius: 10px;
+  background: white;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  padding: 6px;
+  display: none;
+}
+
+#cgh-formula-menu button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #111827;
+}
+
+#cgh-formula-menu button:hover {
+  background: #f3f4f6;
+}
+
+#cgh-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  color: white;
+  background: rgba(17,24,39,.94);
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  box-shadow: 0 10px 28px rgba(0,0,0,.2);
+}
