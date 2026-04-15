@@ -19,6 +19,15 @@
 
 #cgh-panel.cgh-hidden {
   opacity: 0.12;
+  pointer-events: none;
+}
+
+#cgh-panel.cgh-hidden * {
+  pointer-events: none;
+}
+
+#cgh-panel.cgh-hidden .cgh-mini-btn {
+  pointer-events: auto;
 }
 
 #cgh-panel .cgh-header {
