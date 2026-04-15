@@ -81,12 +81,33 @@
   gap: 8px;
   align-items: start;
   font-size: 11px;
-  padding: 4px 0;
+  width: 100%;
+  margin: 0;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  transition: background-color 0.15s ease, transform 0.15s ease;
   border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
 }
 
 #cgh-panel .cgh-item:last-child {
   border-bottom: 0;
+}
+
+#cgh-panel .cgh-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+#cgh-panel .cgh-item:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.9);
+  outline-offset: 2px;
 }
 
 #cgh-panel .cgh-role {
@@ -102,6 +123,13 @@
 #cgh-panel .cgh-token {
   font-variant-numeric: tabular-nums;
   font-weight: 700;
+}
+
+.cgh-target-message {
+  outline: 3px solid rgba(96, 165, 250, 0.9) !important;
+  outline-offset: 4px !important;
+  box-shadow: 0 0 0 6px rgba(96, 165, 250, 0.12) !important;
+  border-radius: 14px;
 }
 
 #cgh-formula-btn,
