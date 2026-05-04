@@ -981,8 +981,9 @@ ${text}\n\
     const menu = formulaMenu;
     menu.innerHTML = '';
 
+    const modeLabels = { latex: 'LaTeX', markdown: 'Markdown', unicode: 'Unicode' };
     const quickBtn = document.createElement('button');
-    quickBtn.textContent = `按默认格式复制（${settings.copyMode === 'markdown' ? 'Markdown' : 'LaTeX'}）`;
+    quickBtn.textContent = `按默认格式复制（${modeLabels[settings.copyMode] || settings.copyMode}）`;
     quickBtn.addEventListener('click', async () => {
       await copyFormulaText(latex, displayMode, settings.copyMode);
       hideFormulaUi();
@@ -991,21 +992,25 @@ ${text}\n\
     const latexBtn = document.createElement('button');
     latexBtn.textContent = '复制 LaTeX';
     latexBtn.addEventListener('click', async () => {
-      await copyText(latex);
-      showToast('已复制 LaTeX');
+      await copyFormulaText(latex, displayMode, 'latex');
       hideFormulaUi();
     });
 
     const markdownBtn = document.createElement('button');
     markdownBtn.textContent = '复制 Markdown';
     markdownBtn.addEventListener('click', async () => {
-      const wrapped = displayMode ? `$$\n${latex}\n$$` : `$${latex}$`;
-      await copyText(wrapped);
-      showToast('已复制 Markdown');
+      await copyFormulaText(latex, displayMode, 'markdown');
       hideFormulaUi();
     });
 
-    menu.append(quickBtn, latexBtn, markdownBtn);
+    const unicodeBtn = document.createElement('button');
+    unicodeBtn.textContent = '复制 Unicode';
+    unicodeBtn.addEventListener('click', async () => {
+      await copyFormulaText(latex, displayMode, 'unicode');
+      hideFormulaUi();
+    });
+
+    menu.append(quickBtn, latexBtn, markdownBtn, unicodeBtn);
     menu.hidden = false;
     menu.style.display = 'block';
     menu.style.visibility = 'hidden';
@@ -1070,11 +1075,297 @@ ${text}\n\
   }
 
   async function copyFormulaText(latex, displayMode, mode) {
-    const text = mode === 'markdown'
-      ? (displayMode ? `$$\n${latex}\n$$` : `$${latex}$`)
-      : latex;
+    let text;
+    let label;
+    if (mode === 'markdown') {
+      text = formatMarkdownFormula(latex, displayMode);
+      label = 'Markdown';
+    } else if (mode === 'unicode') {
+      text = latexToUnicode(latex);
+      label = 'Unicode';
+    } else {
+      text = normalizeLatexForCopy(latex);
+      label = 'LaTeX';
+    }
     await copyText(text);
-    showToast(`已复制${mode === 'markdown' ? ' Markdown' : ' LaTeX'}`);
+    showToast(`已复制 ${label}`);
+  }
+
+  function normalizeLatexForCopy(latex) {
+    if (!latex) return '';
+    return stripMathDelimiters(latex)
+      .replace(/\u00A0/g, ' ')
+      .replace(/\\tag\s*\{([^{}]*)\}/g, '#($1)')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function formatMarkdownFormula(latex, displayMode) {
+    const body = normalizeLatexForMarkdown(latex);
+    if (!body) return '';
+
+    const needsBlock = displayMode ||
+      /\\tag\s*\{[^{}]*\}/.test(body) ||
+      /\\begin\s*\{(?:align|aligned|array|bmatrix|cases|equation|gather|matrix|multline|pmatrix|split|vmatrix|Vmatrix)\}/.test(body);
+
+    return needsBlock ? `$$\n${body}\n$$` : `$${body}$`;
+  }
+
+  function normalizeLatexForMarkdown(latex) {
+    if (!latex) return '';
+    return stripMathDelimiters(latex)
+      .replace(/\u00A0/g, ' ')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t]*\n[ \t]*/g, ' ')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim();
+  }
+
+  function latexToUnicode(latex) {
+    if (!latex) return '';
+
+    const SYMBOLS = {
+      '\\alpha': 'α', '\\beta': 'β', '\\gamma': 'γ', '\\delta': 'δ',
+      '\\epsilon': 'ε', '\\varepsilon': 'ɛ', '\\zeta': 'ζ', '\\eta': 'η',
+      '\\theta': 'θ', '\\vartheta': 'ϑ', '\\iota': 'ι', '\\kappa': 'κ',
+      '\\lambda': 'λ', '\\mu': 'μ', '\\nu': 'ν', '\\xi': 'ξ',
+      '\\omicron': 'ο', '\\pi': 'π', '\\varpi': 'ϖ', '\\rho': 'ρ',
+      '\\varrho': 'ϱ', '\\sigma': 'σ', '\\varsigma': 'ς', '\\tau': 'τ',
+      '\\upsilon': 'υ', '\\phi': 'φ', '\\varphi': 'ϕ', '\\chi': 'χ',
+      '\\psi': 'ψ', '\\omega': 'ω',
+      '\\Gamma': 'Γ', '\\Delta': 'Δ', '\\Theta': 'Θ', '\\Lambda': 'Λ',
+      '\\Xi': 'Ξ', '\\Pi': 'Π', '\\Sigma': 'Σ', '\\Upsilon': 'Υ',
+      '\\Phi': 'Φ', '\\Psi': 'Ψ', '\\Omega': 'Ω',
+      '\\times': '×', '\\cdot': '·', '\\div': '÷', '\\pm': '±', '\\mp': '∓',
+      '\\ast': '∗', '\\star': '⋆', '\\circ': '∘', '\\bullet': '•',
+      '\\oplus': '⊕', '\\ominus': '⊖', '\\otimes': '⊗', '\\oslash': '⊘',
+      '\\odot': '⊙', '\\dagger': '†', '\\ddagger': '‡',
+      '\\leq': '≤', '\\geq': '≥', '\\neq': '≠', '\\approx': '≈',
+      '\\equiv': '≡', '\\sim': '∼', '\\simeq': '≃', '\\cong': '≅',
+      '\\propto': '∝', '\\perp': '⊥', '\\parallel': '∥',
+      '\\ll': '≪', '\\gg': '≫', '\\prec': '≺', '\\succ': '≻',
+      '\\preceq': '≼', '\\succeq': '≽', '\\subset': '⊂', '\\supset': '⊃',
+      '\\subseteq': '⊆', '\\supseteq': '⊇', '\\in': '∈', '\\ni': '∋',
+      '\\notin': '∉', '\\forall': '∀', '\\exists': '∃', '\\nexists': '∄',
+      '\\emptyset': '∅', '\\varnothing': '∅', '\\infty': '∞',
+      '\\partial': '∂', '\\nabla': '∇', '\\triangle': '△',
+      '\\angle': '∠', '\\measuredangle': '∡',
+      '\\rightarrow': '→', '\\Rightarrow': '⇒', '\\longrightarrow': '⟶',
+      '\\Longrightarrow': '⟹', '\\leftarrow': '←', '\\Leftarrow': '⇐',
+      '\\longleftarrow': '⟵', '\\Longleftarrow': '⟸',
+      '\\leftrightarrow': '↔', '\\Leftrightarrow': '⇔',
+      '\\uparrow': '↑', '\\downarrow': '↓', '\\updownarrow': '↕',
+      '\\mapsto': '↦', '\\longmapsto': '⟼', '\\to': '→',
+      '\\land': '∧', '\\lor': '∨', '\\lnot': '¬', '\\neg': '¬',
+      '\\top': '⊤', '\\bot': '⊥',
+      '\\cup': '∪', '\\cap': '∩', '\\setminus': '∖',
+      '\\sum': '∑', '\\prod': '∏', '\\coprod': '∐', '\\int': '∫',
+      '\\iint': '∬', '\\iiint': '∭', '\\oint': '∮',
+      '\\ldots': '…', '\\cdots': '⋯', '\\vdots': '⋮', '\\ddots': '⋱',
+      '\\therefore': '∴', '\\because': '∵',
+      '\\aleph': 'ℵ', '\\hbar': 'ℏ', '\\ell': 'ℓ', '\\wp': '℘',
+      '\\Re': 'ℜ', '\\Im': 'ℑ', '\\prime': '′', '\\backslash': '\\',
+      '\\Box': '□', '\\Diamond': '◇', '\\sharp': '♯', '\\flat': '♭',
+      '\\natural': '♮', '\\clubsuit': '♣', '\\diamondsuit': '♢',
+      '\\heartsuit': '♡', '\\spadesuit': '♠',
+      '\\langle': '⟨', '\\rangle': '⟩', '\\lceil': '⌈', '\\rceil': '⌉',
+      '\\lfloor': '⌊', '\\rfloor': '⌋', '\\|': '‖',
+      '\\{': '{', '\\}': '}',
+      '\\,': ' ', '\\:': ' ', '\\;': ' ', '\\!': '',
+      '\\quad': ' ', '\\qquad': ' ',
+    };
+
+    const SUPERSCRIPT = {
+      '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+      '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+      'a': 'ᵃ', 'b': 'ᵇ', 'c': 'ᶜ', 'd': 'ᵈ', 'e': 'ᵉ',
+      'f': 'ᶠ', 'g': 'ᵍ', 'h': 'ʰ', 'i': 'ⁱ', 'j': 'ʲ',
+      'k': 'ᵏ', 'l': 'ˡ', 'm': 'ᵐ', 'n': 'ⁿ', 'o': 'ᵒ',
+      'p': 'ᵖ', 'r': 'ʳ', 's': 'ˢ', 't': 'ᵗ', 'u': 'ᵘ',
+      'v': 'ᵛ', 'w': 'ʷ', 'x': 'ˣ', 'y': 'ʸ', 'z': 'ᶻ',
+      'A': 'ᴬ', 'B': 'ᴮ', 'D': 'ᴰ', 'E': 'ᴱ', 'G': 'ᴳ',
+      'H': 'ᴴ', 'I': 'ᴵ', 'J': 'ᴶ', 'K': 'ᴷ', 'L': 'ᴸ',
+      'M': 'ᴹ', 'N': 'ᴺ', 'O': 'ᴼ', 'P': 'ᴾ', 'R': 'ᴿ',
+      'T': 'ᵀ', 'U': 'ᵁ', 'V': 'ⱽ', 'W': 'ᵂ',
+      '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾',
+      'α': 'ᵅ', 'β': 'ᵝ', 'γ': 'ᵞ', 'δ': 'ᵟ', 'ε': 'ᵋ',
+      'θ': 'ᶿ', 'ι': 'ᶥ', 'φ': 'ᵠ', 'χ': 'ᵡ',
+    };
+
+    const SUBSCRIPT = {
+      '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+      '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+      'a': 'ₐ', 'e': 'ₑ', 'h': 'ₕ', 'i': 'ᵢ', 'j': 'ⱼ',
+      'k': 'ₖ', 'l': 'ₗ', 'm': 'ₘ', 'n': 'ₙ', 'o': 'ₒ',
+      'p': 'ₚ', 'r': 'ᵣ', 's': 'ₛ', 't': 'ₜ', 'u': 'ᵤ',
+      'v': 'ᵥ', 'x': 'ₓ',
+      '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎',
+      'β': 'ᵦ', 'γ': 'ᵧ', 'ρ': 'ᵨ', 'φ': 'ᵩ', 'χ': 'ᵪ',
+    };
+
+    const SCRIPT = {
+      'A': '𝒜', 'B': 'ℬ', 'C': '𝒞', 'D': '𝒟', 'E': 'ℰ',
+      'F': 'ℱ', 'G': '𝒢', 'H': 'ℋ', 'I': 'ℐ', 'J': '𝒥',
+      'K': '𝒦', 'L': 'ℒ', 'M': 'ℳ', 'N': '𝒩', 'O': '𝒪',
+      'P': '𝒫', 'Q': '𝒬', 'R': 'ℛ', 'S': '𝒮', 'T': '𝒯',
+      'U': '𝒰', 'V': '𝒱', 'W': '𝒲', 'X': '𝒳', 'Y': '𝒴',
+      'Z': '𝒵',
+    };
+
+    let result = normalizeLatexForMarkdown(latex);
+    const equationTags = [];
+    result = result.replace(/\\tag\s*\{([^{}]*)\}/g, (_, tag) => {
+      const cleanedTag = tag.trim();
+      if (cleanedTag) equationTags.push(cleanedTag);
+      return '';
+    });
+
+    // Remove outer delimiters
+    result = result.replace(/^\\\[(.*)\\\]$/s, '$1').replace(/^\\\((.*)\\\)$/s, '$1');
+    result = result.replace(/^\$\$(.*)\$\$$/s, '$1').replace(/^\$(.*)\$$/s, '$1');
+
+    // Handle \text{...} and font commands
+    result = result.replace(/\\operatorname\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\text\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathrm\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathbf\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathit\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathsf\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathtt\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\textrm\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathcal\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, content) => mapUnicodeStyle(content, SCRIPT));
+    result = result.replace(/\\mathfrak\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+    result = result.replace(/\\mathscr\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, content) => mapUnicodeStyle(content, SCRIPT));
+    result = result.replace(/\\mathbb\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, c) => {
+      const BB = { 'C': 'ℂ', 'H': 'ℍ', 'N': 'ℕ', 'P': 'ℙ', 'Q': 'ℚ', 'R': 'ℝ', 'Z': 'ℤ' };
+      return mapUnicodeStyle(c, BB);
+    });
+
+    // Replace known LaTeX commands (longest first to avoid partial matches)
+    const sortedKeys = Object.keys(SYMBOLS).sort((a, b) => b.length - a.length);
+    for (const key of sortedKeys) {
+      const regex = new RegExp(escapeRegExp(key), 'g');
+      result = result.replace(regex, SYMBOLS[key]);
+    }
+
+    // Handle \frac{numerator}{denominator}
+    result = result.replace(/\\frac\{((?:[^{}]|\{[^{}]*\})*)\}\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, num, den) => {
+      return formatUnicodeFraction(num, den);
+    });
+
+    // Handle \sqrt[n]{x} and \sqrt{x}
+    result = result.replace(/\\sqrt\[([^\]]+)\]\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, n, x) => {
+      const superscriptN = [...n].map(c => SUPERSCRIPT[c] || c).join('');
+      return `${superscriptN}√(${x})`;
+    });
+    result = result.replace(/\\sqrt\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, x) => `√(${x})`);
+
+    // Handle superscripts: ^{...} or ^singleChar
+    result = result.replace(/\^\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, content) => {
+      return renderUnicodeScript(content, SUPERSCRIPT, '⁽', '⁾');
+    });
+    result = result.replace(/\^(\S)/g, (_, c) => renderUnicodeScript(c, SUPERSCRIPT, '⁽', '⁾'));
+
+    // Handle subscripts: _{...} or _singleChar
+    result = result.replace(/\_\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, content) => {
+      return renderUnicodeScript(content, SUBSCRIPT, '₍', '₎');
+    });
+    result = result.replace(/\_(\S)/g, (_, c) => renderUnicodeScript(c, SUBSCRIPT, '₍', '₎'));
+
+    // Handle \overline{...}
+    result = result.replace(/\\overline\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̅');
+
+    // Handle \underline{...}
+    result = result.replace(/\\underline\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̲');
+
+    // Handle \hat{...}
+    result = result.replace(/\\hat\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̂');
+
+    // Handle \tilde{...}
+    result = result.replace(/\\tilde\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̃');
+
+    // Handle \vec{...}
+    result = result.replace(/\\vec\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1⃗');
+
+    // Handle \dot{...}
+    result = result.replace(/\\dot\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̇');
+
+    // Handle \ddot{...}
+    result = result.replace(/\\ddot\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̈');
+
+    // Handle \bar{...}
+    result = result.replace(/\\bar\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1̄');
+
+    // Handle \not (strikethrough for relations, e.g., \not\leq → ≰)
+    // Most \not combos are already handled by explicit symbols above
+
+    // Handle \operatorname{...} and \DeclareMathOperator (extract argument)
+    result = result.replace(/\\operatorname\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+
+    // Strip \left, \right, \middle (keep the delimiter they prefix)
+    result = result.replace(/\\left\b/g, '');
+    result = result.replace(/\\right\b/g, '');
+    result = result.replace(/\\middle\b/g, '');
+
+    // Strip \big, \Big, \bigg, \Bigg and their l/r variants (keep the delimiter)
+    result = result.replace(/\\big[lr]?\b/g, '');
+    result = result.replace(/\\Big[lr]?\b/g, '');
+    result = result.replace(/\\bigg[lr]?\b/g, '');
+    result = result.replace(/\\Bigg[lr]?\b/g, '');
+
+    // Remove \tag{...}, \label{...}, and other amsmath commands (must be before brace removal)
+    result = result.replace(/\\tag\{((?:[^{}]|\{[^{}]*\})*)\}/g, '');
+    result = result.replace(/\\label\{((?:[^{}]|\{[^{}]*\})*)\}/g, '');
+    result = result.replace(/\\notag\b/g, '');
+    result = result.replace(/\\(arccos|arcsin|arctan|argmax|argmin|cosh|sinh|tanh|cos|cot|csc|det|dim|exp|gcd|inf|lim|ln|log|max|min|mod|Pr|sec|sin|sup|tan)\b/g, '$1');
+
+    // Remove remaining braces
+    result = result.replace(/[{}]/g, '');
+
+    // Remove leftover backslash-prefixed commands that weren't recognized
+    result = result.replace(/\\[a-zA-Z]+/g, '');
+
+    // Collapse all whitespace (including newlines) into single spaces
+    result = result.replace(/\s+/g, ' ').trim();
+    if (equationTags.length) {
+      result = `${result} (${equationTags.join(', ')})`.trim();
+    }
+
+    return result;
+  }
+
+  function formatUnicodeFraction(num, den) {
+    return `${formatUnicodeFractionPart(num)}/${formatUnicodeFractionPart(den)}`;
+  }
+
+  function formatUnicodeFractionPart(part) {
+    const normalized = (part || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+
+    const compact = normalized.replace(/\s+/g, '');
+    if (/^[A-Za-z0-9_.\u0370-\u03FF\u1D00-\u1DFF\u2070-\u209F\u2100-\u214F\u2200-\u22FF\u{1D400}-\u{1D7FF}]+$/u.test(compact)) {
+      return compact;
+    }
+    return `(${normalized})`;
+  }
+
+  function renderUnicodeScript(content, glyphs, fallbackOpen, fallbackClose) {
+    const compact = (content || '').replace(/\s+/g, '');
+    if (!compact) return '';
+
+    const chars = [...compact];
+    if (chars.every(char => glyphs[char])) {
+      return chars.map(char => glyphs[char]).join('');
+    }
+    return `${fallbackOpen}${compact}${fallbackClose}`;
+  }
+
+  function mapUnicodeStyle(content, styleMap) {
+    return [...(content || '')].map(char => styleMap[char] || char).join('');
+  }
+
+  function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   async function copyText(text) {
@@ -1175,7 +1466,12 @@ ${text}\n\
 
   function cleanLatexCandidate(text) {
     if (!text) return '';
-    return text
+    return stripMathDelimiters(text);
+  }
+
+  function stripMathDelimiters(text) {
+    if (!text) return '';
+    return String(text)
       .replace(/^\$\$(.*)\$\$$/s, '$1')
       .replace(/^\$(.*)\$$/s, '$1')
       .replace(/^\\\[(.*)\\\]$/s, '$1')
