@@ -261,7 +261,7 @@
     for (const node of nodes) {
       const role = inferRole(node);
       const text = extractTextWithLatex(node);
-      if (!text.trim()) continue;
+      if (!text.trim() && !hasExportableImages(node)) continue;
       messages.push({
         role,
         text,
@@ -546,18 +546,23 @@ ${text}\n\
       document.body.appendChild(container);
       await waitForExportAssets(container);
 
-      let dataUrl;
+      let dataUrls;
       let usedFallback = false;
       try {
-        dataUrl = await renderElementToPng(container);
+        dataUrls = await renderElementToPngParts(container);
       } catch (primaryError) {
         console.warn('[CGH] DOM PNG export failed, using canvas fallback', primaryError);
-        dataUrl = renderMessagesToCanvasPng(selectedMessages);
+        if (selectedMessages.some(message => hasExportableImages(message.node))) {
+          throw new Error('图片导出被浏览器限制，请尝试重新打开页面后再导出');
+        }
+        dataUrls = [renderMessagesToCanvasPng(selectedMessages)];
         usedFallback = true;
       }
 
-      downloadDataUrl(dataUrl, buildExportFilename());
-      showToast(`已导出 ${selectedMessages.length} 条消息${usedFallback ? '（兼容模式）' : ''}`);
+      dataUrls.forEach((dataUrl, index) => {
+        downloadDataUrl(dataUrl, buildExportFilename(index, dataUrls.length));
+      });
+      showToast(`已导出 ${selectedMessages.length} 条消息${dataUrls.length > 1 ? `（${dataUrls.length} 张）` : ''}${usedFallback ? '（兼容模式）' : ''}`);
     } catch (error) {
       console.error('[CGH] Failed to export PNG', error);
       showToast(`导出失败：${getErrorMessage(error)}`, 3000);
@@ -602,7 +607,7 @@ ${text}\n\
     bubble.className = 'cgh-export-bubble';
 
     const content = message.role === 'user'
-      ? buildPlainExportContent(message.text)
+      ? buildUserExportContent(message)
       : extractExportContent(message.node);
     if (content.childNodes.length) {
       bubble.appendChild(content);
@@ -614,16 +619,67 @@ ${text}\n\
     return wrapper;
   }
 
+  function buildUserExportContent(message) {
+    const container = buildPlainExportContent(message.text);
+    appendExportImages(container, message.node);
+    return container;
+  }
+
   function buildPlainExportContent(text) {
     const container = document.createElement('div');
     container.className = 'cgh-export-plain';
     const blocks = normalizeWhitespacePreservingParagraphs(text || '').split(/\n{2,}/).filter(Boolean);
-    for (const block of blocks.length ? blocks : ['']) {
+    for (const block of blocks) {
       const paragraph = document.createElement('p');
       paragraph.textContent = block;
       container.appendChild(paragraph);
     }
     return container;
+  }
+
+  function appendExportImages(container, sourceNode) {
+    const images = collectExportableImages(sourceNode);
+    if (!images.length) return;
+
+    const grid = document.createElement('div');
+    grid.className = 'cgh-export-image-grid';
+
+    for (const sourceImage of images) {
+      const image = sourceImage.cloneNode(false);
+      const src = sourceImage.currentSrc || sourceImage.src || sourceImage.getAttribute('src') || '';
+      if (src) {
+        image.src = src;
+      }
+      image.className = 'cgh-export-image';
+      image.removeAttribute('srcset');
+      image.removeAttribute('sizes');
+      image.removeAttribute('style');
+      image.loading = 'eager';
+      image.decoding = 'sync';
+      image.referrerPolicy = 'no-referrer';
+      grid.appendChild(image);
+    }
+
+    container.appendChild(grid);
+  }
+
+  function collectExportableImages(root) {
+    if (!(root instanceof Element)) return [];
+    return [...root.querySelectorAll('img')].filter((img) => {
+      if (!(img instanceof HTMLImageElement)) return false;
+      if (img.closest('#cgh-panel, #cgh-toast, #cgh-formula-btn, #cgh-formula-menu')) return false;
+      const src = img.currentSrc || img.src || '';
+      if (!src || src.startsWith('data:image/svg+xml')) return false;
+      if (/avatar|user|profile/i.test(`${img.alt || ''} ${img.className || ''}`) && !img.closest('[data-message-author-role="user"]')) return false;
+      const rect = img.getBoundingClientRect();
+      const naturalWidth = img.naturalWidth || Number(img.getAttribute('width')) || rect.width;
+      const naturalHeight = img.naturalHeight || Number(img.getAttribute('height')) || rect.height;
+      return naturalWidth >= 24 && naturalHeight >= 24;
+    });
+  }
+
+  function hasExportableImages(node) {
+    return collectExportableImages(node).length > 0;
   }
 
   function extractExportContent(node) {
@@ -684,6 +740,8 @@ ${text}\n\
   }
 
   function normalizeExportContent(root) {
+    normalizeExportTables(root);
+
     root.querySelectorAll('pre').forEach((pre) => {
       pre.classList.add('cgh-export-code-block');
     });
@@ -702,6 +760,58 @@ ${text}\n\
       img.decoding = 'sync';
       img.referrerPolicy = 'no-referrer';
     });
+  }
+
+  function normalizeExportTables(root) {
+    root.querySelectorAll('table').forEach((table) => {
+      table.classList.add('cgh-export-table');
+      table.removeAttribute('style');
+
+      const columnCount = getTableColumnCount(table);
+      if (columnCount > 0) {
+        table.style.setProperty('--cgh-table-columns', String(columnCount));
+      }
+
+      markTableWrappersForExport(table, root);
+    });
+
+    root.querySelectorAll('th, td').forEach((cell) => {
+      cell.removeAttribute('style');
+      cell.classList.add('cgh-export-table-cell');
+    });
+  }
+
+  function getTableColumnCount(table) {
+    const rows = [...table.querySelectorAll('tr')];
+    return rows.reduce((max, row) => {
+      const count = [...row.children].reduce((sum, cell) => {
+        const span = Number(cell.getAttribute('colspan') || '1');
+        return sum + (Number.isFinite(span) ? Math.max(1, span) : 1);
+      }, 0);
+      return Math.max(max, count);
+    }, 0);
+  }
+
+  function shouldFlattenTableWrapper(wrapper) {
+    if (!(wrapper instanceof HTMLElement)) return false;
+    const className = wrapper.className || '';
+    const style = window.getComputedStyle(wrapper);
+    return /overflow|table|scroll|markdown/i.test(String(className)) ||
+      /(auto|scroll|overlay|hidden)/.test(`${style.overflow} ${style.overflowX} ${style.overflowY}`);
+  }
+
+  function markTableWrappersForExport(table, root) {
+    let current = table.parentElement;
+    while (current && current !== root) {
+      if (!(current instanceof HTMLElement)) break;
+
+      if (shouldFlattenTableWrapper(current) || current.querySelector('table') === table) {
+        current.classList.add('cgh-export-table-wrap');
+        current.removeAttribute('style');
+      }
+
+      current = current.parentElement;
+    }
   }
 
   function stripFormulaContainerChrome(formula) {
@@ -741,6 +851,7 @@ ${text}\n\
 
     const images = [...container.querySelectorAll('img')];
     await Promise.all(images.map(waitForImage));
+    await Promise.all(images.map(inlineImageForCanvas));
     await waitForLayoutStability(120);
   }
 
@@ -755,11 +866,63 @@ ${text}\n\
     });
   }
 
-  async function renderElementToPng(element) {
+  async function inlineImageForCanvas(img) {
+    if (!(img instanceof HTMLImageElement)) return;
+    const src = img.currentSrc || img.src || '';
+    if (!src || src.startsWith('data:')) return;
+
+    try {
+      const fetchedDataUrl = await fetchImageAsDataUrl(src);
+      if (fetchedDataUrl) {
+        img.src = fetchedDataUrl;
+        img.removeAttribute('srcset');
+        img.removeAttribute('sizes');
+        return;
+      }
+    } catch (error) {
+      console.warn('[CGH] Failed to fetch export image', error);
+    }
+
+    try {
+      const canvas = document.createElement('canvas');
+      const width = img.naturalWidth || img.width;
+      const height = img.naturalHeight || img.height;
+      if (!width || !height) return;
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      context.drawImage(img, 0, 0, width, height);
+      img.src = canvas.toDataURL('image/png');
+      img.removeAttribute('srcset');
+      img.removeAttribute('sizes');
+    } catch (error) {
+      console.warn('[CGH] Failed to inline export image', error);
+    }
+  }
+
+  async function fetchImageAsDataUrl(src) {
+    const response = await fetch(src, { credentials: 'include', cache: 'force-cache' });
+    if (!response.ok) return '';
+    const blob = await response.blob();
+    if (!blob.type.startsWith('image/')) return '';
+    return await blobToDataUrl(blob);
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+      reader.onerror = () => reject(reader.error || new Error('Image read failed'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function renderElementToPngParts(element) {
     const rect = element.getBoundingClientRect();
     const width = Math.ceil(rect.width);
     const height = Math.ceil(rect.height);
-    const scale = Math.min(2, window.devicePixelRatio || 1);
+    const scale = getExportScale(width, height);
     const exportClone = cloneElementWithInlineStyles(element);
     exportClone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
     injectMathFontStyles(exportClone);
@@ -773,20 +936,46 @@ ${text}\n\
     `;
     const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
     const image = await loadImage(svgUrl);
+    return renderImageToPngParts(image, width, height, scale);
+  }
+
+  function renderImageToPngParts(image, width, height, scale) {
+    const maxCanvasPixels = 24000000;
+    const maxPartHeight = Math.max(1200, Math.floor(maxCanvasPixels / Math.max(1, width * scale * scale)));
+    const parts = [];
+
+    for (let sourceY = 0; sourceY < height; sourceY += maxPartHeight) {
+      const partHeight = Math.min(maxPartHeight, height - sourceY);
+      parts.push(renderImageSliceToPng(image, width, partHeight, sourceY, scale));
+    }
+
+    return parts;
+  }
+
+  function renderImageSliceToPng(image, width, height, sourceY, scale) {
     const canvas = document.createElement('canvas');
     canvas.width = Math.ceil(width * scale);
     canvas.height = Math.ceil(height * scale);
     const context = canvas.getContext('2d');
     if (!context) throw new Error('Canvas context unavailable');
     context.scale(scale, scale);
-    context.drawImage(image, 0, 0, width, height);
+    context.drawImage(image, 0, sourceY, width, height, 0, 0, width, height);
     return canvas.toDataURL('image/png');
   }
 
+  function getExportScale(width, height) {
+    const deviceScale = Math.min(2, window.devicePixelRatio || 1);
+    const maxSide = 32767;
+    const maxPixels = 24000000;
+    const sideScale = Math.min(maxSide / Math.max(width, height), deviceScale);
+    const pixelScale = Math.sqrt(maxPixels / Math.max(1, width * height));
+    return Math.max(1, Math.min(deviceScale, sideScale, pixelScale));
+  }
+
   function renderMessagesToCanvasPng(messages) {
-    const width = 920;
+    const width = 1040;
     const padding = 34;
-    const maxBubbleWidth = 760;
+    const maxBubbleWidth = 880;
     const bubblePaddingX = 18;
     const bubblePaddingY = 16;
     const lineHeight = 26;
@@ -1004,6 +1193,7 @@ ${text}\n\
   function cloneElementWithInlineStyles(element) {
     const clone = element.cloneNode(true);
     inlineComputedStyles(element, clone);
+    applyExportTableInlineOverrides(clone);
     clone.style.setProperty('position', 'static');
     clone.style.setProperty('left', 'auto');
     clone.style.setProperty('top', 'auto');
@@ -1011,6 +1201,51 @@ ${text}\n\
     clone.style.setProperty('bottom', 'auto');
     clone.style.setProperty('margin', '0');
     return clone;
+  }
+
+  function applyExportTableInlineOverrides(root) {
+    root.querySelectorAll('.cgh-export-table-wrap').forEach((wrapper) => {
+      if (!(wrapper instanceof HTMLElement)) return;
+      wrapper.style.setProperty('width', '100%', 'important');
+      wrapper.style.setProperty('max-width', '100%', 'important');
+      wrapper.style.setProperty('overflow', 'visible', 'important');
+      wrapper.style.setProperty('overflow-x', 'visible', 'important');
+      wrapper.style.setProperty('overflow-y', 'visible', 'important');
+      wrapper.style.setProperty('margin', '1em 0', 'important');
+      wrapper.style.setProperty('padding', '0', 'important');
+      wrapper.style.setProperty('scrollbar-width', 'none', 'important');
+      wrapper.style.setProperty('-ms-overflow-style', 'none', 'important');
+    });
+
+    root.querySelectorAll('.cgh-export-table').forEach((table) => {
+      if (!(table instanceof HTMLElement)) return;
+      table.style.setProperty('width', '100%', 'important');
+      table.style.setProperty('max-width', '100%', 'important');
+      table.style.setProperty('min-width', '0', 'important');
+      table.style.setProperty('table-layout', 'fixed', 'important');
+      table.style.setProperty('border-collapse', 'separate', 'important');
+      table.style.setProperty('border-spacing', '0', 'important');
+      table.style.setProperty('overflow', 'hidden', 'important');
+      table.style.setProperty('border', '1px solid rgba(255, 255, 255, 0.14)', 'important');
+      table.style.setProperty('border-radius', '10px', 'important');
+      table.style.setProperty('background', '#111111', 'important');
+      table.style.setProperty('font-size', '0.86em', 'important');
+      table.style.setProperty('line-height', '1.48', 'important');
+    });
+
+    root.querySelectorAll('.cgh-export-table-cell').forEach((cell) => {
+      if (!(cell instanceof HTMLElement)) return;
+      cell.style.setProperty('min-width', '0', 'important');
+      cell.style.setProperty('max-width', 'none', 'important');
+      cell.style.setProperty('border', '0', 'important');
+      cell.style.setProperty('border-right', '1px solid rgba(255, 255, 255, 0.12)', 'important');
+      cell.style.setProperty('border-bottom', '1px solid rgba(255, 255, 255, 0.12)', 'important');
+      cell.style.setProperty('padding', '8px 10px', 'important');
+      cell.style.setProperty('vertical-align', 'top', 'important');
+      cell.style.setProperty('white-space', 'normal', 'important');
+      cell.style.setProperty('overflow-wrap', 'anywhere', 'important');
+      cell.style.setProperty('word-break', 'break-word', 'important');
+    });
   }
 
   function injectMathFontStyles(root) {
@@ -1187,10 +1422,11 @@ ${text}\n\
     link.remove();
   }
 
-  function buildExportFilename() {
+  function buildExportFilename(partIndex = 0, partCount = 1) {
     const now = new Date();
     const pad = value => String(value).padStart(2, '0');
-    return `chatgpt-conversation-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.png`;
+    const suffix = partCount > 1 ? `-part-${String(partIndex + 1).padStart(2, '0')}` : '';
+    return `chatgpt-conversation-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}${suffix}.png`;
   }
 
   function formatExportDate(date) {

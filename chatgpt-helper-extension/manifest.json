@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Context Helper",
-  "version": "1.0.3",
-  "description": "Estimate visible token usage in ChatGPT and copy formulas as LaTeX or Markdown.",
+  "version": "1.1.0",
+  "description": "Estimate visible token usage in ChatGPT, copy formulas, and export selected conversations as PNG.",
   "permissions": ["storage", "clipboardWrite"],
   "host_permissions": [
     "https://chatgpt.com/*",

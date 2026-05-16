@@ -200,7 +200,7 @@
   position: fixed;
   left: -10000px;
   top: 0;
-  width: 920px;
+  width: 1040px;
   box-sizing: border-box;
   padding: 34px;
   color: #ececec;
@@ -272,7 +272,8 @@
   border-radius: 0;
   padding: 0;
   box-shadow: none;
-  max-width: 720px;
+  width: 100%;
+  max-width: 940px;
 }
 
 .cgh-export-bubble > *:first-child,
@@ -341,27 +342,93 @@
   color: #cfcfcf;
 }
 
-.cgh-export-bubble table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.92em;
+.cgh-export-table-wrap {
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow: visible !important;
+  overflow-x: visible !important;
+  overflow-y: visible !important;
+  margin: 1em 0 !important;
+  padding: 0 !important;
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.cgh-export-table-wrap::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+.cgh-export-bubble table,
+.cgh-export-table {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  table-layout: fixed !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 10px !important;
+  background: #111111 !important;
+  font-size: 0.86em !important;
+  line-height: 1.48 !important;
 }
 
 .cgh-export-bubble th,
-.cgh-export-bubble td {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  padding: 7px 9px;
+.cgh-export-bubble td,
+.cgh-export-table-cell {
+  min-width: 0 !important;
+  max-width: none !important;
+  border: 0 !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.12) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
+  padding: 8px 10px !important;
+  vertical-align: top !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  hyphens: auto !important;
 }
 
 .cgh-export-bubble th {
-  background: #212121;
-  color: #f5f5f5;
+  background: #202020 !important;
+  color: #f5f5f5 !important;
+  font-weight: 700 !important;
+}
+
+.cgh-export-bubble tr:last-child > th,
+.cgh-export-bubble tr:last-child > td {
+  border-bottom: 0 !important;
+}
+
+.cgh-export-bubble th:last-child,
+.cgh-export-bubble td:last-child {
+  border-right: 0 !important;
 }
 
 .cgh-export-bubble img {
   max-width: 100%;
   height: auto;
   border-radius: 10px;
+}
+
+.cgh-export-image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cgh-export-image {
+  display: block;
+  width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+  border-radius: 10px;
+  background: #111111;
+  border: 1px solid rgba(255, 255, 255, 0.10);
 }
 
 .cgh-export-formula,
