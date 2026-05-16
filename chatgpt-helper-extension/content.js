@@ -155,7 +155,7 @@
     panel.innerHTML = `
       <div class="cgh-header">
         <div class="cgh-title">上下文估算</div>
-        <div style="display:flex;gap:6px;">
+        <div class="cgh-actions">
           <button class="cgh-mini-btn" data-action="refresh">刷新</button>
           <button class="cgh-mini-btn" data-action="toggle">展开</button>
         </div>

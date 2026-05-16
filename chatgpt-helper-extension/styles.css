@@ -3,7 +3,7 @@
   right: 18px;
   bottom: 18px;
   z-index: 2147483647;
-  width: 280px;
+  width: 240px;
   background: rgba(17, 24, 39, 0.95);
   color: #f9fafb;
   border-radius: 14px;
@@ -18,16 +18,19 @@
 }
 
 #cgh-panel.cgh-hidden {
-  opacity: 0.12;
-  pointer-events: none;
+  width: auto;
+  min-width: 0;
+  padding: 8px;
 }
 
-#cgh-panel.cgh-hidden * {
-  pointer-events: none;
+#cgh-panel.cgh-hidden .cgh-title,
+#cgh-panel.cgh-hidden .cgh-main,
+#cgh-panel.cgh-hidden .cgh-list {
+  display: none;
 }
 
-#cgh-panel.cgh-hidden .cgh-mini-btn {
-  pointer-events: auto;
+#cgh-panel.cgh-hidden .cgh-header {
+  margin-bottom: 0;
 }
 
 #cgh-panel .cgh-header {
@@ -41,6 +44,11 @@
 #cgh-panel .cgh-title {
   font-size: 13px;
   font-weight: 700;
+}
+
+#cgh-panel .cgh-actions {
+  display: flex;
+  gap: 6px;
 }
 
 #cgh-panel .cgh-mini-btn {
