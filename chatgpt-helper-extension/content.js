@@ -27,6 +27,10 @@
   let jumpSequence = 0;
   let jumpRunning = false;
   let pendingJump = null;
+  let exportSelectionMode = false;
+  let exportRendering = false;
+  let exportClickListenerBound = false;
+  const selectedMessageSignatures = new Set();
   const boundFormulaNodes = new WeakSet();
   const CONVERSATION_READY_QUIET_MS = 500;
   const PRE_JUMP_SCROLL_IDLE_MS = 260;
@@ -137,7 +141,9 @@
     const messages = collectMessages();
     currentMessages = messages;
     const stats = computeStats(messages);
+    syncSelectedMessagesWithCurrent();
     renderPanel(stats);
+    updateExportUi();
   }
 
   function ensurePanelAlive() {
@@ -166,6 +172,14 @@
         <div>消息数</div><div id="cgh-count">-</div>
         <div>状态</div><div id="cgh-status">-</div>
       </div>
+      <div class="cgh-export">
+        <div class="cgh-export-buttons">
+          <button class="cgh-mini-btn" data-action="export-select">选择导出</button>
+          <button class="cgh-mini-btn" data-action="export-png" disabled>导出 PNG</button>
+          <button class="cgh-mini-btn" data-action="export-cancel" hidden>取消</button>
+        </div>
+        <div class="cgh-export-status" id="cgh-export-status">未选择消息</div>
+      </div>
       <div class="cgh-list" id="cgh-list"></div>
     `;
 
@@ -178,11 +192,21 @@
         panel.classList.toggle('cgh-hidden');
         target.textContent = panel.classList.contains('cgh-hidden') ? '展开' : '收起';
       }
+      if (action === 'export-select') {
+        setExportSelectionMode(true);
+      }
+      if (action === 'export-png') {
+        void exportSelectedMessages();
+      }
+      if (action === 'export-cancel') {
+        setExportSelectionMode(false, { clearSelection: true });
+      }
     });
 
     document.body.appendChild(panel);
     listContainer = panel.querySelector('#cgh-list');
     listContainer.addEventListener('click', handleMessageListClick);
+    ensureExportSelectionListener();
   }
 
   function ensureFormulaUi() {
@@ -381,7 +405,808 @@ ${text}\n\
 
     event.preventDefault();
     event.stopPropagation();
+    if (exportSelectionMode) {
+      toggleMessageSelection(index);
+      return;
+    }
+
     queueMessageJump(index);
+  }
+
+  function ensureExportSelectionListener() {
+    if (exportClickListenerBound) return;
+    document.addEventListener('click', handleExportSelectionClick, true);
+    exportClickListenerBound = true;
+  }
+
+  function handleExportSelectionClick(event) {
+    if (!exportSelectionMode) return;
+
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest('#cgh-panel') || target.closest('#cgh-toast') || target.closest('#cgh-formula-btn') || target.closest('#cgh-formula-menu')) {
+      return;
+    }
+
+    const messageIndex = currentMessages.findIndex(message => message.node === target || message.node.contains(target));
+    if (messageIndex < 0) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    toggleMessageSelection(messageIndex);
+  }
+
+  function setExportSelectionMode(enabled, options = {}) {
+    exportSelectionMode = enabled;
+    document.documentElement.classList.toggle('cgh-export-mode', exportSelectionMode);
+
+    if (!enabled && options.clearSelection) {
+      selectedMessageSignatures.clear();
+    }
+
+    updateExportUi();
+    if (enabled) {
+      showToast('点击对话消息进行选择');
+    }
+  }
+
+  function toggleMessageSelection(index) {
+    const message = currentMessages[index];
+    if (!message) return;
+
+    if (selectedMessageSignatures.has(message.signature)) {
+      selectedMessageSignatures.delete(message.signature);
+    } else {
+      selectedMessageSignatures.add(message.signature);
+    }
+
+    updateExportUi();
+  }
+
+  function syncSelectedMessagesWithCurrent() {
+    const currentSignatures = new Set(currentMessages.map(message => message.signature));
+    for (const signature of [...selectedMessageSignatures]) {
+      if (!currentSignatures.has(signature)) {
+        selectedMessageSignatures.delete(signature);
+      }
+    }
+  }
+
+  function getSelectedMessages() {
+    return currentMessages.filter(message => selectedMessageSignatures.has(message.signature));
+  }
+
+  function updateExportUi() {
+    updateSelectedMessageClasses();
+    updateMessageListSelectionState();
+
+    if (!panel) return;
+    panel.classList.toggle('cgh-exporting', exportSelectionMode);
+
+    const selectBtn = panel.querySelector('[data-action="export-select"]');
+    const exportBtn = panel.querySelector('[data-action="export-png"]');
+    const cancelBtn = panel.querySelector('[data-action="export-cancel"]');
+    const statusEl = panel.querySelector('#cgh-export-status');
+    const selectedCount = selectedMessageSignatures.size;
+
+    if (selectBtn instanceof HTMLButtonElement) {
+      selectBtn.textContent = exportSelectionMode ? '继续选择' : '选择导出';
+    }
+    if (exportBtn instanceof HTMLButtonElement) {
+      exportBtn.disabled = selectedCount === 0 || exportRendering;
+      exportBtn.textContent = exportRendering ? '导出中...' : '导出 PNG';
+    }
+    if (cancelBtn instanceof HTMLButtonElement) {
+      cancelBtn.hidden = !exportSelectionMode && selectedCount === 0;
+    }
+    if (statusEl) {
+      statusEl.textContent = selectedCount ? `已选择 ${selectedCount} 条消息` : (exportSelectionMode ? '点击消息选择导出内容' : '未选择消息');
+    }
+  }
+
+  function updateSelectedMessageClasses() {
+    for (const message of currentMessages) {
+      if (!(message.node instanceof HTMLElement)) continue;
+      message.node.classList.toggle('cgh-export-selected', selectedMessageSignatures.has(message.signature));
+      message.node.classList.toggle('cgh-export-selectable', exportSelectionMode);
+    }
+  }
+
+  function updateMessageListSelectionState() {
+    if (!listContainer) return;
+    listContainer.querySelectorAll('.cgh-item').forEach((item) => {
+      if (!(item instanceof HTMLElement)) return;
+      const index = Number(item.dataset.messageIndex);
+      const message = currentMessages[index];
+      const selected = !!message && selectedMessageSignatures.has(message.signature);
+      item.classList.toggle('cgh-item-selected', selected);
+      item.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    });
+  }
+
+  async function exportSelectedMessages() {
+    if (exportRendering) return;
+
+    currentMessages = collectMessages();
+    syncSelectedMessagesWithCurrent();
+    const selectedMessages = getSelectedMessages();
+    if (!selectedMessages.length) {
+      showToast('请先选择消息');
+      updateExportUi();
+      return;
+    }
+
+    exportRendering = true;
+    updateExportUi();
+    showToast('正在生成 PNG...', 0);
+
+    let container = null;
+    try {
+      container = buildExportContainer(selectedMessages);
+      document.body.appendChild(container);
+      await waitForExportAssets(container);
+
+      let dataUrl;
+      let usedFallback = false;
+      try {
+        dataUrl = await renderElementToPng(container);
+      } catch (primaryError) {
+        console.warn('[CGH] DOM PNG export failed, using canvas fallback', primaryError);
+        dataUrl = renderMessagesToCanvasPng(selectedMessages);
+        usedFallback = true;
+      }
+
+      downloadDataUrl(dataUrl, buildExportFilename());
+      showToast(`已导出 ${selectedMessages.length} 条消息${usedFallback ? '（兼容模式）' : ''}`);
+    } catch (error) {
+      console.error('[CGH] Failed to export PNG', error);
+      showToast(`导出失败：${getErrorMessage(error)}`, 3000);
+    } finally {
+      container?.remove();
+      exportRendering = false;
+      updateExportUi();
+    }
+  }
+
+  function buildExportContainer(messages) {
+    const container = document.createElement('div');
+    container.className = 'cgh-export-canvas';
+
+    const title = document.createElement('div');
+    title.className = 'cgh-export-title';
+    title.textContent = 'ChatGPT 对话摘录';
+    container.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'cgh-export-meta';
+    meta.textContent = `${formatExportDate(new Date())} · ${messages.length} 条消息`;
+    container.appendChild(meta);
+
+    for (const [index, message] of messages.entries()) {
+      container.appendChild(buildExportMessage(message, index));
+    }
+
+    return container;
+  }
+
+  function buildExportMessage(message, index) {
+    const wrapper = document.createElement('section');
+    wrapper.className = `cgh-export-message cgh-export-${message.role === 'user' ? 'user' : 'assistant'}`;
+
+    const label = document.createElement('div');
+    label.className = 'cgh-export-label';
+    label.textContent = message.role === 'user' ? '用户' : '助手';
+    wrapper.appendChild(label);
+
+    const bubble = document.createElement('div');
+    bubble.className = 'cgh-export-bubble';
+
+    const content = message.role === 'user'
+      ? buildPlainExportContent(message.text)
+      : extractExportContent(message.node);
+    if (content.childNodes.length) {
+      bubble.appendChild(content);
+    } else {
+      bubble.textContent = message.text || `第 ${index + 1} 条消息`;
+    }
+
+    wrapper.appendChild(bubble);
+    return wrapper;
+  }
+
+  function buildPlainExportContent(text) {
+    const container = document.createElement('div');
+    container.className = 'cgh-export-plain';
+    const blocks = normalizeWhitespacePreservingParagraphs(text || '').split(/\n{2,}/).filter(Boolean);
+    for (const block of blocks.length ? blocks : ['']) {
+      const paragraph = document.createElement('p');
+      paragraph.textContent = block;
+      container.appendChild(paragraph);
+    }
+    return container;
+  }
+
+  function extractExportContent(node) {
+    const source = findMessageContentNode(node) || node;
+    const clone = source.cloneNode(true);
+
+    clone.querySelectorAll([
+      '#cgh-panel',
+      '#cgh-toast',
+      '#cgh-formula-btn',
+      '#cgh-formula-menu',
+      '.cgh-export-selection-badge',
+      'button',
+      '[role="button"]',
+      '[data-testid*="copy"]',
+      '[data-testid*="turn-action"]',
+    ].join(',')).forEach(el => el.remove());
+
+    clone.classList?.remove('cgh-export-selected', 'cgh-export-selectable', 'cgh-target-message');
+    stripInlineInteractionAttributes(clone);
+    normalizeExportContent(clone);
+    return clone;
+  }
+
+  function findMessageContentNode(node) {
+    if (!(node instanceof Element)) return null;
+
+    const candidates = [
+      '[data-message-author-role] [data-message-id]',
+      '[data-message-author-role] .markdown',
+      '.markdown',
+      '[data-testid="conversation-turn"] .markdown',
+      '[class*="markdown"]',
+    ];
+
+    for (const selector of candidates) {
+      const candidate = node.matches(selector) ? node : node.querySelector(selector);
+      if (candidate instanceof Element && normalizeWhitespace(candidate.textContent || '')) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  function stripInlineInteractionAttributes(root) {
+    const nodes = root.querySelectorAll('*');
+    for (const node of [root, ...nodes]) {
+      if (!(node instanceof Element)) continue;
+      for (const attr of [...node.attributes]) {
+        if (attr.name.startsWith('on')) {
+          node.removeAttribute(attr.name);
+        }
+      }
+      node.removeAttribute('contenteditable');
+      node.removeAttribute('tabindex');
+    }
+  }
+
+  function normalizeExportContent(root) {
+    root.querySelectorAll('pre').forEach((pre) => {
+      pre.classList.add('cgh-export-code-block');
+    });
+    root.querySelectorAll('code').forEach((code) => {
+      code.classList.add('cgh-export-code');
+    });
+    root.querySelectorAll(FORMULA_SELECTORS).forEach((formula) => {
+      formula.classList.add('cgh-export-formula');
+      if (isDisplayFormula(formula)) {
+        formula.classList.add('cgh-export-formula-block');
+      }
+      stripFormulaContainerChrome(formula);
+    });
+    root.querySelectorAll('img').forEach((img) => {
+      img.loading = 'eager';
+      img.decoding = 'sync';
+      img.referrerPolicy = 'no-referrer';
+    });
+  }
+
+  function stripFormulaContainerChrome(formula) {
+    if (!(formula instanceof HTMLElement || formula instanceof SVGElement)) return;
+
+    const targets = [
+      formula,
+      ...formula.querySelectorAll('.katex-display, .katex, .katex-html, mjx-container, svg, math'),
+    ];
+
+    for (const target of targets) {
+      if (!(target instanceof HTMLElement || target instanceof SVGElement)) continue;
+      target.style.setProperty('background', 'transparent', 'important');
+      target.style.setProperty('background-color', 'transparent', 'important');
+      target.style.setProperty('border', '0', 'important');
+      target.style.setProperty('box-shadow', 'none', 'important');
+    }
+
+    formula.querySelectorAll('.katex, .katex *').forEach((node) => {
+      if (node instanceof HTMLElement) {
+        node.style.removeProperty('font-family');
+      }
+    });
+
+    formula.style.setProperty('padding', '0', 'important');
+    formula.style.setProperty('border-radius', '0', 'important');
+  }
+
+  async function waitForExportAssets(container) {
+    if (document.fonts?.ready) {
+      try {
+        await document.fonts.ready;
+      } catch (error) {
+        // Font loading failures should not block image export.
+      }
+    }
+
+    const images = [...container.querySelectorAll('img')];
+    await Promise.all(images.map(waitForImage));
+    await waitForLayoutStability(120);
+  }
+
+  function waitForImage(img) {
+    if (!(img instanceof HTMLImageElement)) return Promise.resolve();
+    if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+    return new Promise(resolve => {
+      const done = () => resolve();
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', done, { once: true });
+      window.setTimeout(done, 1800);
+    });
+  }
+
+  async function renderElementToPng(element) {
+    const rect = element.getBoundingClientRect();
+    const width = Math.ceil(rect.width);
+    const height = Math.ceil(rect.height);
+    const scale = Math.min(2, window.devicePixelRatio || 1);
+    const exportClone = cloneElementWithInlineStyles(element);
+    exportClone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+    injectMathFontStyles(exportClone);
+    const html = new XMLSerializer().serializeToString(exportClone);
+    const svg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+        <foreignObject width="100%" height="100%">
+          ${html}
+        </foreignObject>
+      </svg>
+    `;
+    const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+    const image = await loadImage(svgUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(width * scale);
+    canvas.height = Math.ceil(height * scale);
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Canvas context unavailable');
+    context.scale(scale, scale);
+    context.drawImage(image, 0, 0, width, height);
+    return canvas.toDataURL('image/png');
+  }
+
+  function renderMessagesToCanvasPng(messages) {
+    const width = 920;
+    const padding = 34;
+    const maxBubbleWidth = 760;
+    const bubblePaddingX = 18;
+    const bubblePaddingY = 16;
+    const lineHeight = 26;
+    const paragraphGap = 10;
+    const messageGap = 18;
+    const labelHeight = 18;
+    const labelGap = 8;
+    const scale = Math.min(2, window.devicePixelRatio || 1);
+
+    const measureCanvas = document.createElement('canvas');
+    const measureContext = measureCanvas.getContext('2d');
+    if (!measureContext) throw new Error('Canvas context unavailable');
+
+    const measuredMessages = messages.map((message) => {
+      measureContext.font = '16px -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif';
+      const contentWidth = maxBubbleWidth - bubblePaddingX * 2;
+      const blocks = buildCanvasTextBlocks(message.text || '');
+      const measuredBlocks = blocks.map(block => {
+        const lines = wrapCanvasText(measureContext, block.text, contentWidth);
+        const maxLineWidth = lines.reduce((max, line) => Math.max(max, measureContext.measureText(line).width), 0);
+        return { ...block, lines, maxLineWidth };
+      });
+
+      const textHeight = measuredBlocks.reduce((height, block, index) => {
+        const blockHeight = Math.max(1, block.lines.length) * lineHeight;
+        return height + blockHeight + (index === measuredBlocks.length - 1 ? 0 : paragraphGap);
+      }, 0);
+      const maxLineWidth = measuredBlocks.reduce((max, block) => Math.max(max, block.maxLineWidth), 0);
+      const bubbleWidth = Math.min(maxBubbleWidth, Math.max(240, Math.ceil(maxLineWidth + bubblePaddingX * 2)));
+      const bubbleHeight = bubblePaddingY * 2 + textHeight;
+
+      return {
+        role: message.role === 'user' ? 'user' : 'assistant',
+        blocks: measuredBlocks,
+        bubbleWidth,
+        bubbleHeight,
+        totalHeight: labelHeight + labelGap + bubbleHeight,
+      };
+    });
+
+    const headerHeight = 30 + 6 + 20 + 24;
+    const contentHeight = measuredMessages.reduce((height, message, index) => {
+      return height + message.totalHeight + (index === measuredMessages.length - 1 ? 0 : messageGap);
+    }, 0);
+    const height = Math.ceil(padding * 2 + headerHeight + contentHeight);
+    if (height > 32000) {
+      throw new Error('图片过长，请分批导出');
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(width * scale);
+    canvas.height = Math.ceil(height * scale);
+
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Canvas context unavailable');
+    context.scale(scale, scale);
+    context.fillStyle = '#0d0d0d';
+    context.fillRect(0, 0, width, height);
+
+    let y = padding;
+    context.fillStyle = '#f9fafb';
+    context.font = '800 24px -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif';
+    context.textBaseline = 'top';
+    context.fillText('ChatGPT 对话摘录', padding, y);
+    y += 36;
+
+    context.fillStyle = '#94a3b8';
+    context.font = '13px -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif';
+    context.fillText(`${formatExportDate(new Date())} · ${messages.length} 条消息 · 兼容模式`, padding, y);
+    y += 44;
+
+    for (let index = 0; index < measuredMessages.length; index += 1) {
+      const message = measuredMessages[index];
+      const isUser = message.role === 'user';
+      const bubbleX = isUser ? width - padding - message.bubbleWidth : padding;
+      const contentX = isUser ? bubbleX + bubblePaddingX : bubbleX;
+      const label = isUser ? '用户' : '助手';
+      const labelWidth = context.measureText(label).width;
+
+      context.fillStyle = '#94a3b8';
+      context.font = '700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif';
+      context.fillText(label, isUser ? bubbleX + message.bubbleWidth - labelWidth : bubbleX, y);
+      y += labelHeight + labelGap;
+
+      if (isUser) {
+        drawRoundRect(context, bubbleX, y, message.bubbleWidth, message.bubbleHeight, 14);
+        context.fillStyle = '#2f2f2f';
+        context.fill();
+        context.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+        context.lineWidth = 1;
+        context.stroke();
+      }
+
+      let textY = y + (isUser ? bubblePaddingY : 0);
+      const textX = contentX;
+      context.textBaseline = 'top';
+
+      for (let blockIndex = 0; blockIndex < message.blocks.length; blockIndex += 1) {
+        const block = message.blocks[blockIndex];
+        const formulaLike = isFormulaTextBlock(block.text);
+        context.fillStyle = formulaLike ? '#d8d8d8' : '#ececec';
+        context.font = formulaLike
+          ? '16px "Times New Roman", "Cambria Math", serif'
+          : '16px -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif';
+
+        for (const line of block.lines) {
+          context.fillText(line, textX, textY);
+          textY += lineHeight;
+        }
+
+        if (blockIndex !== message.blocks.length - 1) {
+          textY += paragraphGap;
+        }
+      }
+
+      y += (isUser ? message.bubbleHeight : message.bubbleHeight - bubblePaddingY * 2) + (index === measuredMessages.length - 1 ? 0 : messageGap);
+    }
+
+    return canvas.toDataURL('image/png');
+  }
+
+  function buildCanvasTextBlocks(text) {
+    const normalized = normalizeWhitespacePreservingParagraphs(text || '');
+    if (!normalized) return [{ text: '' }];
+    return normalized.split(/\n{2,}/).map(block => ({ text: block.trim() })).filter(block => block.text);
+  }
+
+  function normalizeWhitespacePreservingParagraphs(text) {
+    return String(text)
+      .replace(/\u00A0/g, ' ')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function wrapCanvasText(context, text, maxWidth) {
+    const lines = [];
+    const paragraphs = String(text || '').split('\n');
+    for (const paragraph of paragraphs) {
+      const tokens = tokenizeForCanvasWrap(paragraph);
+      let line = '';
+
+      for (const token of tokens) {
+        const nextLine = line ? `${line}${token}` : token.trimStart();
+        if (!nextLine) continue;
+
+        if (context.measureText(nextLine).width <= maxWidth) {
+          line = nextLine;
+          continue;
+        }
+
+        if (line) {
+          lines.push(line.trimEnd());
+          line = '';
+        }
+
+        if (context.measureText(token).width <= maxWidth) {
+          line = token.trimStart();
+        } else {
+          line = wrapLongCanvasToken(context, token, maxWidth, lines);
+        }
+      }
+
+      if (line) {
+        lines.push(line.trimEnd());
+      } else if (!tokens.length) {
+        lines.push('');
+      }
+    }
+
+    return lines.length ? lines : [''];
+  }
+
+  function tokenizeForCanvasWrap(text) {
+    return String(text || '').match(/[\u3400-\u9FFF\uF900-\uFAFF]|[^\s\u3400-\u9FFF\uF900-\uFAFF]+|\s+/g) || [];
+  }
+
+  function wrapLongCanvasToken(context, token, maxWidth, lines) {
+    let line = '';
+    for (const char of [...token]) {
+      const nextLine = line + char;
+      if (context.measureText(nextLine).width <= maxWidth) {
+        line = nextLine;
+      } else {
+        if (line) lines.push(line);
+        line = char;
+      }
+    }
+    return line;
+  }
+
+  function isFormulaTextBlock(text) {
+    const trimmed = String(text || '').trim();
+    return /^\${1,2}[\s\S]+\${1,2}$/.test(trimmed) || /\\(?:frac|sqrt|sum|int|alpha|beta|gamma|theta|lambda|mu|sigma|omega|begin|end)\b/.test(trimmed);
+  }
+
+  function drawRoundRect(context, x, y, width, height, radius) {
+    const r = Math.min(radius, width / 2, height / 2);
+    context.beginPath();
+    context.moveTo(x + r, y);
+    context.lineTo(x + width - r, y);
+    context.quadraticCurveTo(x + width, y, x + width, y + r);
+    context.lineTo(x + width, y + height - r);
+    context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+    context.lineTo(x + r, y + height);
+    context.quadraticCurveTo(x, y + height, x, y + height - r);
+    context.lineTo(x, y + r);
+    context.quadraticCurveTo(x, y, x + r, y);
+    context.closePath();
+  }
+
+  function cloneElementWithInlineStyles(element) {
+    const clone = element.cloneNode(true);
+    inlineComputedStyles(element, clone);
+    clone.style.setProperty('position', 'static');
+    clone.style.setProperty('left', 'auto');
+    clone.style.setProperty('top', 'auto');
+    clone.style.setProperty('right', 'auto');
+    clone.style.setProperty('bottom', 'auto');
+    clone.style.setProperty('margin', '0');
+    return clone;
+  }
+
+  function injectMathFontStyles(root) {
+    const cssText = collectMathFontCss();
+    if (!cssText) return;
+
+    const style = document.createElement('style');
+    style.textContent = cssText;
+    root.insertBefore(style, root.firstChild);
+  }
+
+  function collectMathFontCss() {
+    const chunks = [];
+    for (const sheet of [...document.styleSheets]) {
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch (error) {
+        continue;
+      }
+      if (!rules) continue;
+
+      for (const rule of [...rules]) {
+        const text = rule.cssText || '';
+        if (/(KaTeX|MathJax|MJX|mjx)/.test(text)) {
+          chunks.push(text);
+        }
+      }
+    }
+
+    chunks.push(`
+      .katex, .katex * {
+        font-family: KaTeX_Main, KaTeX_Math, KaTeX_Size1, KaTeX_AMS, "Times New Roman", serif !important;
+      }
+      .katex .mathnormal, .katex .mord.mathnormal, .katex .mord.text {
+        font-family: KaTeX_Math, KaTeX_Main, "Times New Roman", serif !important;
+      }
+      .katex .mathbf {
+        font-family: KaTeX_Main, "Times New Roman", serif !important;
+        font-weight: 700 !important;
+      }
+      mjx-container, mjx-container * {
+        font-family: MathJax_Main, MathJax_Math, MJXZERO, "Times New Roman", serif !important;
+      }
+    `);
+
+    return chunks.join('\n');
+  }
+
+  function inlineComputedStyles(source, target) {
+    if (!(source instanceof Element) || !(target instanceof Element)) return;
+
+    const computed = window.getComputedStyle(source);
+    const importantProperties = [
+      'align-items',
+      'background',
+      'background-color',
+      'border',
+      'border-bottom',
+      'border-bottom-color',
+      'border-bottom-left-radius',
+      'border-bottom-right-radius',
+      'border-bottom-style',
+      'border-bottom-width',
+      'border-collapse',
+      'border-color',
+      'border-left',
+      'border-left-color',
+      'border-left-style',
+      'border-left-width',
+      'border-radius',
+      'border-right',
+      'border-right-color',
+      'border-right-style',
+      'border-right-width',
+      'border-spacing',
+      'border-style',
+      'border-top',
+      'border-top-color',
+      'border-top-left-radius',
+      'border-top-right-radius',
+      'border-top-style',
+      'border-top-width',
+      'border-width',
+      'box-shadow',
+      'box-sizing',
+      'color',
+      'display',
+      'flex-direction',
+      'flex-wrap',
+      'font',
+      'font-family',
+      'font-size',
+      'font-style',
+      'font-variant',
+      'font-variant-numeric',
+      'font-weight',
+      'gap',
+      'grid-template-columns',
+      'height',
+      'justify-content',
+      'letter-spacing',
+      'left',
+      'line-height',
+      'list-style',
+      'list-style-position',
+      'list-style-type',
+      'margin',
+      'margin-bottom',
+      'margin-left',
+      'margin-right',
+      'margin-top',
+      'max-height',
+      'max-width',
+      'min-height',
+      'min-width',
+      'object-fit',
+      'opacity',
+      'overflow',
+      'overflow-wrap',
+      'padding',
+      'padding-bottom',
+      'padding-left',
+      'padding-right',
+      'padding-top',
+      'position',
+      'right',
+      'text-align',
+      'text-decoration',
+      'text-indent',
+      'text-transform',
+      'top',
+      'transform',
+      'transform-origin',
+      'vertical-align',
+      'white-space',
+      'width',
+      'word-break',
+    ];
+
+    for (const property of importantProperties) {
+      const value = computed.getPropertyValue(property);
+      if (value) {
+        target.style.setProperty(property, value);
+      }
+    }
+
+    if (computed.display === 'inline') {
+      target.style.setProperty('display', 'inline');
+    }
+
+    const sourceChildren = [...source.children];
+    const targetChildren = [...target.children];
+    for (let index = 0; index < sourceChildren.length; index += 1) {
+      inlineComputedStyles(sourceChildren[index], targetChildren[index]);
+    }
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Image load failed'));
+      image.src = src;
+    });
+  }
+
+  function downloadDataUrl(dataUrl, filename) {
+    const link = document.createElement('a');
+    link.href = dataUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function buildExportFilename() {
+    const now = new Date();
+    const pad = value => String(value).padStart(2, '0');
+    return `chatgpt-conversation-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.png`;
+  }
+
+  function formatExportDate(date) {
+    return new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(date);
+  }
+
+  function getErrorMessage(error) {
+    if (error instanceof Error && error.message) return error.message;
+    if (typeof error === 'string' && error) return error;
+    return '未知错误';
   }
 
   function queueMessageJump(index) {
