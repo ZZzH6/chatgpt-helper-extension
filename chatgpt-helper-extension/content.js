@@ -29,6 +29,7 @@
   let pendingJump = null;
   let exportSelectionMode = false;
   let exportRendering = false;
+  let activeExportFormat = null;
   let exportClickListenerBound = false;
   const selectedMessageSignatures = new Set();
   const boundFormulaNodes = new WeakSet();
@@ -176,6 +177,8 @@
         <div class="cgh-export-buttons">
           <button class="cgh-mini-btn" data-action="export-select">选择导出</button>
           <button class="cgh-mini-btn" data-action="export-png" disabled>导出 PNG</button>
+          <button class="cgh-mini-btn" data-action="export-pdf" disabled>导出 PDF</button>
+          <button class="cgh-mini-btn" data-action="export-print-pdf" disabled>打印 PDF</button>
           <button class="cgh-mini-btn" data-action="export-cancel" hidden>取消</button>
         </div>
         <div class="cgh-export-status" id="cgh-export-status">未选择消息</div>
@@ -196,7 +199,13 @@
         setExportSelectionMode(true);
       }
       if (action === 'export-png') {
-        void exportSelectedMessages();
+        void exportSelectedMessages('png');
+      }
+      if (action === 'export-pdf') {
+        void exportSelectedMessages('pdf');
+      }
+      if (action === 'export-print-pdf') {
+        void exportSelectedMessages('print-pdf');
       }
       if (action === 'export-cancel') {
         setExportSelectionMode(false, { clearSelection: true });
@@ -484,7 +493,9 @@ ${text}\n\
     panel.classList.toggle('cgh-exporting', exportSelectionMode);
 
     const selectBtn = panel.querySelector('[data-action="export-select"]');
-    const exportBtn = panel.querySelector('[data-action="export-png"]');
+    const exportPngBtn = panel.querySelector('[data-action="export-png"]');
+    const exportPdfBtn = panel.querySelector('[data-action="export-pdf"]');
+    const exportPrintPdfBtn = panel.querySelector('[data-action="export-print-pdf"]');
     const cancelBtn = panel.querySelector('[data-action="export-cancel"]');
     const statusEl = panel.querySelector('#cgh-export-status');
     const selectedCount = selectedMessageSignatures.size;
@@ -492,9 +503,17 @@ ${text}\n\
     if (selectBtn instanceof HTMLButtonElement) {
       selectBtn.textContent = exportSelectionMode ? '继续选择' : '选择导出';
     }
-    if (exportBtn instanceof HTMLButtonElement) {
-      exportBtn.disabled = selectedCount === 0 || exportRendering;
-      exportBtn.textContent = exportRendering ? '导出中...' : '导出 PNG';
+    if (exportPngBtn instanceof HTMLButtonElement) {
+      exportPngBtn.disabled = selectedCount === 0 || exportRendering;
+      exportPngBtn.textContent = exportRendering && activeExportFormat === 'png' ? '导出中...' : '导出 PNG';
+    }
+    if (exportPdfBtn instanceof HTMLButtonElement) {
+      exportPdfBtn.disabled = selectedCount === 0 || exportRendering;
+      exportPdfBtn.textContent = exportRendering && activeExportFormat === 'pdf' ? '导出中...' : '导出 PDF';
+    }
+    if (exportPrintPdfBtn instanceof HTMLButtonElement) {
+      exportPrintPdfBtn.disabled = selectedCount === 0 || exportRendering;
+      exportPrintPdfBtn.textContent = exportRendering && activeExportFormat === 'print-pdf' ? '准备中...' : '打印 PDF';
     }
     if (cancelBtn instanceof HTMLButtonElement) {
       cancelBtn.hidden = !exportSelectionMode && selectedCount === 0;
@@ -524,8 +543,10 @@ ${text}\n\
     });
   }
 
-  async function exportSelectedMessages() {
+  async function exportSelectedMessages(format = 'png') {
     if (exportRendering) return;
+    const exportFormat = format === 'pdf' ? 'pdf' : (format === 'print-pdf' ? 'print-pdf' : 'png');
+    const exportLabel = exportFormat === 'print-pdf' ? '打印 PDF' : exportFormat.toUpperCase();
 
     currentMessages = collectMessages();
     syncSelectedMessagesWithCurrent();
@@ -537,11 +558,18 @@ ${text}\n\
     }
 
     exportRendering = true;
+    activeExportFormat = exportFormat;
     updateExportUi();
-    showToast('正在生成 PNG...', 0);
+    showToast(exportFormat === 'print-pdf' ? '正在准备打印 PDF...' : `正在生成 ${exportLabel}...`, 0);
 
     let container = null;
     try {
+      if (exportFormat === 'print-pdf') {
+        await exportSelectedMessagesAsPrintPdf(selectedMessages);
+        showToast('已打开打印窗口，请选择保存为 PDF', 4000);
+        return;
+      }
+
       container = buildExportContainer(selectedMessages);
       document.body.appendChild(container);
       await waitForExportAssets(container);
@@ -559,18 +587,554 @@ ${text}\n\
         usedFallback = true;
       }
 
-      dataUrls.forEach((dataUrl, index) => {
-        downloadDataUrl(dataUrl, buildExportFilename(index, dataUrls.length));
-      });
-      showToast(`已导出 ${selectedMessages.length} 条消息${dataUrls.length > 1 ? `（${dataUrls.length} 张）` : ''}${usedFallback ? '（兼容模式）' : ''}`);
+      if (exportFormat === 'pdf') {
+        const pdfBlob = await buildPdfFromPngParts(dataUrls);
+        downloadBlob(pdfBlob, buildExportFilename(0, 1, 'pdf'));
+      } else {
+        dataUrls.forEach((dataUrl, index) => {
+          downloadDataUrl(dataUrl, buildExportFilename(index, dataUrls.length));
+        });
+      }
+
+      const partText = exportFormat === 'pdf'
+        ? (dataUrls.length > 1 ? `（${dataUrls.length} 页）` : '')
+        : (dataUrls.length > 1 ? `（${dataUrls.length} 张）` : '');
+      showToast(`已导出 ${selectedMessages.length} 条消息${partText}${usedFallback ? '（兼容模式）' : ''}`);
     } catch (error) {
-      console.error('[CGH] Failed to export PNG', error);
+      console.error(`[CGH] Failed to export ${exportLabel}`, error);
       showToast(`导出失败：${getErrorMessage(error)}`, 3000);
     } finally {
       container?.remove();
       exportRendering = false;
+      activeExportFormat = null;
       updateExportUi();
     }
+  }
+
+  async function exportSelectedMessagesAsPrintPdf(messages) {
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      throw new Error('浏览器阻止了打印窗口，请允许此站点弹出窗口后重试');
+    }
+
+    printWindow.document.open();
+    printWindow.document.write(buildPrintLoadingHtml());
+    printWindow.document.close();
+
+    let container = null;
+    try {
+      container = buildPrintPdfContainer(messages);
+      container.style.position = 'fixed';
+      container.style.left = '-10000px';
+      container.style.top = '0';
+      container.style.width = '794px';
+      container.style.maxWidth = '794px';
+      container.style.background = '#0d0d0d';
+      container.style.color = '#f7f7f8';
+      container.style.opacity = '0';
+      container.style.pointerEvents = 'none';
+      document.body.appendChild(container);
+
+      await waitForExportAssets(container);
+      const title = buildPrintPdfTitle();
+      const html = buildPrintPdfHtml(container.innerHTML, title);
+
+      printWindow.document.open();
+      printWindow.document.write(html);
+      printWindow.document.close();
+      await waitForPrintWindowReady(printWindow);
+      printWindow.focus();
+      printWindow.print();
+    } catch (error) {
+      try {
+        if (!printWindow.closed) {
+          printWindow.document.body.innerHTML = `<pre style="white-space:pre-wrap;font:14px sans-serif;color:#b91c1c;">打印 PDF 准备失败：${escapeHtml(getErrorMessage(error))}</pre>`;
+        }
+      } catch (renderError) {
+        // Ignore secondary print-window rendering failures.
+      }
+      throw error;
+    } finally {
+      container?.remove();
+    }
+  }
+
+  function buildPrintPdfContainer(messages) {
+    const container = document.createElement('article');
+    container.className = 'cgh-print-document';
+
+    const title = document.createElement('h1');
+    title.textContent = 'ChatGPT 对话摘录';
+    container.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'cgh-print-meta';
+    meta.textContent = `${formatExportDate(new Date())} · ${messages.length} 条消息`;
+    container.appendChild(meta);
+
+    for (const [index, message] of messages.entries()) {
+      const section = document.createElement('section');
+      section.className = `cgh-print-message cgh-print-${message.role === 'user' ? 'user' : 'assistant'}`;
+
+      const role = document.createElement('div');
+      role.className = 'cgh-print-role';
+      role.textContent = `${index + 1}. ${message.role === 'user' ? '用户' : '助手'}`;
+      section.appendChild(role);
+
+      const contentWrap = document.createElement('div');
+      contentWrap.className = 'cgh-print-content';
+      const content = message.role === 'user'
+        ? buildUserExportContent(message)
+        : extractExportContent(message.node);
+      if (content.childNodes.length) {
+        contentWrap.appendChild(content);
+      } else {
+        const paragraph = document.createElement('p');
+        paragraph.textContent = message.text || `第 ${index + 1} 条消息`;
+        contentWrap.appendChild(paragraph);
+      }
+
+      section.appendChild(contentWrap);
+      container.appendChild(section);
+    }
+
+    return container;
+  }
+
+  function buildPrintLoadingHtml() {
+    return `<!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8">
+          <title>准备打印 PDF</title>
+        </head>
+        <body style="font:14px sans-serif;color:#111827;padding:24px;">正在准备打印 PDF...</body>
+      </html>`;
+  }
+
+  function buildPrintPdfHtml(contentHtml, title) {
+    return `<!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8">
+          <title>${escapeHtml(title)}</title>
+          <style>${getPrintPdfCss()}</style>
+        </head>
+        <body>
+          ${contentHtml}
+        </body>
+      </html>`;
+  }
+
+  function buildPrintPdfTitle() {
+    return buildExportFilename(0, 1, 'pdf').replace(/\.pdf$/i, '');
+  }
+
+  function getPrintPdfCss() {
+    return `
+      @page {
+        size: A4;
+        margin: 1.8cm 1.8cm 1.6cm 1.8cm;
+        background: #0d0d0d;
+      }
+
+      *, *::before, *::after {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #0d0d0d;
+        color: #f7f7f8;
+      }
+
+      body {
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 12.5pt;
+        line-height: 1.65;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        background: #0d0d0d;
+      }
+
+      .cgh-print-document {
+        width: 100%;
+        color: #f7f7f8;
+      }
+
+      .cgh-print-document > h1 {
+        margin: 0 0 20pt;
+        color: #e5e7eb;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 13pt;
+        font-weight: 700;
+        line-height: 1.35;
+        text-align: left;
+        text-indent: 0;
+        break-after: avoid;
+        page-break-after: avoid;
+      }
+
+      .cgh-print-role {
+        margin: 20pt 0 12pt;
+        padding-top: 12pt;
+        border-top: 0.75pt solid #2f2f2f;
+        color: #a1a1aa;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 9pt;
+        font-weight: 700;
+        line-height: 1.3;
+        text-align: left;
+        text-indent: 0;
+        break-after: avoid;
+        page-break-after: avoid;
+      }
+
+      .cgh-print-content h1,
+      .cgh-print-content h2 {
+        margin: 20pt 0 12pt;
+        color: #f7f7f8;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 24pt;
+        font-weight: 700;
+        line-height: 1.35;
+        text-align: left;
+        text-indent: 0;
+        break-after: avoid;
+        page-break-after: avoid;
+      }
+
+      .cgh-print-content h3 {
+        margin: 18pt 0 10pt;
+        color: #f7f7f8;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 18pt;
+        font-weight: 700;
+        line-height: 1.35;
+        text-align: left;
+        text-indent: 0;
+        break-after: avoid;
+        page-break-after: avoid;
+      }
+
+      .cgh-print-content h4,
+      .cgh-print-content h5,
+      .cgh-print-content h6 {
+        margin: 14pt 0 8pt;
+        color: #f7f7f8;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 15pt;
+        font-weight: 700;
+        line-height: 1.4;
+        text-align: left;
+        text-indent: 0;
+        break-after: avoid;
+        page-break-after: avoid;
+      }
+
+      .cgh-print-meta {
+        margin: 0 0 18pt;
+        color: #a1a1aa;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 9.5pt;
+        line-height: 1.4;
+        text-align: left;
+        text-indent: 0;
+      }
+
+      .cgh-print-message {
+        margin: 0 0 14pt;
+        break-inside: auto;
+        page-break-inside: auto;
+      }
+
+      .cgh-print-content,
+      .cgh-print-content p,
+      .cgh-print-content li,
+      .cgh-print-content blockquote {
+        color: #f7f7f8;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 13pt;
+        line-height: 1.65;
+        text-align: left;
+      }
+
+      .cgh-print-content p {
+        margin: 0 0 10pt;
+        text-indent: 0;
+      }
+
+      .cgh-print-content p,
+      .cgh-print-content li,
+      .cgh-print-content span,
+      .cgh-print-content strong,
+      .cgh-print-content em,
+      .cgh-print-content div {
+        color: #f7f7f8 !important;
+      }
+
+      .cgh-print-content ul,
+      .cgh-print-content ol {
+        margin: 0 0 10pt 1.5em;
+        padding: 0 0 0 1em;
+      }
+
+      .cgh-print-content li {
+        margin: 0 0 5pt;
+        padding-left: 0;
+        text-indent: 0;
+      }
+
+      .cgh-print-content blockquote {
+        margin: 10pt 0 10pt 1em;
+        padding: 0 0 0 1em;
+        border-left: 2pt solid #52525b;
+        color: #d4d4d8;
+        text-indent: 0;
+      }
+
+      .cgh-print-content a {
+        color: #c7d2fe;
+        text-decoration: underline;
+      }
+
+      .cgh-print-content pre,
+      .cgh-print-content .cgh-export-code-block {
+        margin: 12pt 0;
+        padding: 10pt 12pt;
+        color: #f4f4f5;
+        background: #171717;
+        border: 0.75pt solid #3f3f46;
+        border-radius: 8pt;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 9.8pt;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow: visible;
+        text-align: left;
+        text-indent: 0;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+
+      .cgh-print-content code,
+      .cgh-print-content .cgh-export-code {
+        color: #f4f4f5;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 9.8pt;
+        background: transparent;
+      }
+
+      .cgh-print-content :not(pre) > code,
+      .cgh-print-content :not(pre) > .cgh-export-code {
+        padding: 1pt 3pt;
+        background: #262626;
+        border: 0.5pt solid #3f3f46;
+        border-radius: 4pt;
+      }
+
+      .cgh-print-content img,
+      .cgh-print-content .cgh-export-image {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        margin: 12pt auto;
+        object-fit: contain;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+
+      .cgh-print-content .cgh-export-image-grid {
+        display: block;
+        margin: 12pt 0;
+        text-align: center;
+      }
+
+      .cgh-print-content table,
+      .cgh-print-content .cgh-export-table {
+        width: auto;
+        max-width: 100%;
+        margin: 12pt auto;
+        border-collapse: collapse;
+        border-spacing: 0;
+        color: #f7f7f8;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 10.5pt;
+        line-height: 1.55;
+        table-layout: auto;
+        break-inside: auto;
+        page-break-inside: auto;
+      }
+
+      .cgh-print-content th,
+      .cgh-print-content td,
+      .cgh-print-content .cgh-export-table-cell {
+        padding: 6pt 8pt;
+        border: 0.75pt solid #52525b;
+        color: #f7f7f8;
+        background: #111111;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+        font-size: 10.5pt;
+        line-height: 1.55;
+        text-align: left;
+        vertical-align: top;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .cgh-print-content th {
+        font-weight: 700;
+        text-align: center;
+        background: #1f1f1f;
+      }
+
+      .cgh-print-content .cgh-export-table-wrap {
+        width: 100%;
+        max-width: 100%;
+        margin: 12pt auto;
+        padding: 0;
+        overflow: visible;
+        text-align: center;
+      }
+
+      .cgh-print-content .katex .katex-mathml,
+      .cgh-print-content mjx-assistive-mml,
+      .cgh-print-content semantics > annotation,
+      .cgh-print-content semantics > annotation-xml {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        padding: 0 !important;
+        margin: -1px !important;
+        overflow: hidden !important;
+        clip: rect(0, 0, 0, 0) !important;
+        white-space: nowrap !important;
+        border: 0 !important;
+      }
+
+      .cgh-print-content .katex,
+      .cgh-print-content mjx-container,
+      .cgh-print-content math,
+      .cgh-print-content .cgh-export-formula {
+        color: #f7f7f8;
+        font-family: KaTeX_Main, MathJax_Main, "Times New Roman", "Cambria Math", serif;
+        font-size: 18pt;
+        line-height: 1.35;
+        text-indent: 0;
+      }
+
+      .cgh-print-content .katex-display,
+      .cgh-print-content mjx-container[display="true"],
+      .cgh-print-content .cgh-export-formula-block {
+        display: block;
+        margin: 14pt auto;
+        text-align: center;
+        text-indent: 0;
+        overflow: visible;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+
+      .cgh-print-content svg {
+        max-width: 100%;
+        overflow: visible;
+      }
+
+      .cgh-print-content .katex .fbox,
+      .cgh-print-content .katex .fcolorbox {
+        border-color: #f7f7f8 !important;
+      }
+
+      .cgh-print-content .katex .cancel-pad,
+      .cgh-print-content .katex .boxpad {
+        color: #f7f7f8 !important;
+      }
+
+      .cgh-print-content mjx-container svg [stroke]:not([stroke="none"]) {
+        stroke: #f7f7f8 !important;
+      }
+
+      .cgh-print-content mjx-container svg [fill]:not([fill="none"]),
+      .cgh-print-content .katex svg [fill]:not([fill="none"]) {
+        fill: #f7f7f8 !important;
+      }
+
+      .cgh-print-content .cgh-export-formula,
+      .cgh-print-content .cgh-export-formula * {
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+
+      @media print {
+        html,
+        body {
+          background: #0d0d0d !important;
+          color: #f7f7f8 !important;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+      }
+
+      ${collectMathFontCss()}
+    `;
+  }
+
+  async function waitForPrintWindowReady(printWindow) {
+    const doc = printWindow.document;
+    const view = doc.defaultView || printWindow;
+
+    await new Promise(resolve => {
+      if (doc.readyState === 'complete') {
+        resolve();
+        return;
+      }
+      const done = () => resolve();
+      view.addEventListener('load', done, { once: true });
+      view.setTimeout(done, 1200);
+    });
+
+    if (doc.fonts?.ready) {
+      try {
+        await doc.fonts.ready;
+      } catch (error) {
+        // Font loading failures should not block the print dialog.
+      }
+    }
+
+    const images = [...doc.images];
+    await Promise.all(images.map(img => waitForPrintImage(img, view)));
+    await new Promise(resolve => view.requestAnimationFrame
+      ? view.requestAnimationFrame(() => view.requestAnimationFrame(resolve))
+      : view.setTimeout(resolve, 120));
+  }
+
+  function waitForPrintImage(img, view) {
+    if (!img || String(img.tagName).toLowerCase() !== 'img') return Promise.resolve();
+    if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+    return new Promise(resolve => {
+      const done = () => resolve();
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', done, { once: true });
+      view.setTimeout(done, 2200);
+    });
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function buildExportContainer(messages) {
@@ -1270,7 +1834,7 @@ ${text}\n\
 
       for (const rule of [...rules]) {
         const text = rule.cssText || '';
-        if (/(KaTeX|MathJax|MJX|mjx)/.test(text)) {
+        if (/(katex|KaTeX|MathJax|MJX|mjx|mjx-container|mjx-assistive-mml)/.test(text)) {
           chunks.push(text);
         }
       }
@@ -1422,11 +1986,164 @@ ${text}\n\
     link.remove();
   }
 
-  function buildExportFilename(partIndex = 0, partCount = 1) {
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function buildPdfFromPngParts(dataUrls) {
+    if (!dataUrls.length) throw new Error('没有可写入 PDF 的图片');
+
+    const images = [];
+    for (const dataUrl of dataUrls) {
+      const image = await loadImage(dataUrl);
+      images.push(await preparePdfImage(image));
+    }
+
+    return createImagePdf(images);
+  }
+
+  async function preparePdfImage(image) {
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    if (!width || !height) throw new Error('图片尺寸无效');
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) throw new Error('Canvas context unavailable');
+
+    context.fillStyle = '#0d0d0d';
+    context.fillRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+
+    const rgba = context.getImageData(0, 0, width, height).data;
+    const rgb = new Uint8Array(width * height * 3);
+    for (let source = 0, target = 0; source < rgba.length; source += 4, target += 3) {
+      rgb[target] = rgba[source];
+      rgb[target + 1] = rgba[source + 1];
+      rgb[target + 2] = rgba[source + 2];
+    }
+
+    const compressed = await deflatePdfBytes(rgb);
+    return {
+      width,
+      height,
+      data: compressed.data,
+      filter: compressed.filter,
+    };
+  }
+
+  async function deflatePdfBytes(bytes) {
+    if (typeof CompressionStream !== 'function') {
+      return { data: bytes, filter: '' };
+    }
+
+    try {
+      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate'));
+      const blob = await new Response(stream).blob();
+      return {
+        data: new Uint8Array(await blob.arrayBuffer()),
+        filter: '/Filter /FlateDecode',
+      };
+    } catch (error) {
+      console.warn('[CGH] PDF compression failed, writing raw image stream', error);
+      return { data: bytes, filter: '' };
+    }
+  }
+
+  function createImagePdf(images) {
+    const pageTreeId = 2;
+    const objectCount = 2 + images.length * 3;
+    const pageIds = images.map((_, index) => 3 + index * 3);
+    const chunks = [];
+    const offsets = new Array(objectCount + 1).fill(0);
+    const encoder = new TextEncoder();
+    let byteOffset = 0;
+
+    const appendString = (value) => {
+      const bytes = encoder.encode(value);
+      chunks.push(bytes);
+      byteOffset += bytes.length;
+    };
+
+    const appendBytes = (bytes) => {
+      chunks.push(bytes);
+      byteOffset += bytes.length;
+    };
+
+    const addObject = (id, parts) => {
+      offsets[id] = byteOffset;
+      appendString(`${id} 0 obj\n`);
+      for (const part of Array.isArray(parts) ? parts : [parts]) {
+        if (typeof part === 'string') appendString(part);
+        else appendBytes(part);
+      }
+      appendString('\nendobj\n');
+    };
+
+    appendString('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+    addObject(1, '<< /Type /Catalog /Pages 2 0 R >>');
+    addObject(pageTreeId, `<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] >>`);
+
+    images.forEach((image, index) => {
+      const pageId = 3 + index * 3;
+      const contentId = pageId + 1;
+      const imageId = pageId + 2;
+      const pageSize = getPdfPageSize(image.width, image.height);
+      const pageWidth = formatPdfNumber(pageSize.width);
+      const pageHeight = formatPdfNumber(pageSize.height);
+      const content = `q\n${pageWidth} 0 0 ${pageHeight} 0 0 cm\n/Im${index + 1} Do\nQ`;
+
+      addObject(pageId, `<< /Type /Page /Parent ${pageTreeId} 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /XObject << /Im${index + 1} ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>`);
+      addObject(contentId, `<< /Length ${encoder.encode(content).length} >>\nstream\n${content}\nendstream`);
+      addObject(imageId, [
+        `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Interpolate false ${image.filter} /Length ${image.data.length} >>\nstream\n`,
+        image.data,
+        '\nendstream',
+      ]);
+    });
+
+    const xrefOffset = byteOffset;
+    appendString(`xref\n0 ${objectCount + 1}\n`);
+    appendString('0000000000 65535 f \n');
+    for (let id = 1; id <= objectCount; id += 1) {
+      appendString(`${String(offsets[id]).padStart(10, '0')} 00000 n \n`);
+    }
+    appendString(`trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
+
+    return new Blob(chunks, { type: 'application/pdf' });
+  }
+
+  function getPdfPageSize(imageWidth, imageHeight) {
+    const a4WidthPoints = 595.28;
+    const maxPagePoints = 14400;
+    const heightAtA4Width = a4WidthPoints * imageHeight / imageWidth;
+    const width = heightAtA4Width > maxPagePoints
+      ? maxPagePoints * imageWidth / imageHeight
+      : a4WidthPoints;
+    return {
+      width,
+      height: width * imageHeight / imageWidth,
+    };
+  }
+
+  function formatPdfNumber(value) {
+    return Number(value).toFixed(2).replace(/\.?0+$/, '') || '0';
+  }
+
+  function buildExportFilename(partIndex = 0, partCount = 1, extension = 'png') {
     const now = new Date();
     const pad = value => String(value).padStart(2, '0');
     const suffix = partCount > 1 ? `-part-${String(partIndex + 1).padStart(2, '0')}` : '';
-    return `chatgpt-conversation-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}${suffix}.png`;
+    return `chatgpt-conversation-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}${suffix}.${extension}`;
   }
 
   function formatExportDate(date) {
