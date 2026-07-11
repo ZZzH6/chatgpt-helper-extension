@@ -1,12 +1,8 @@
 (() => {
   'use strict';
 
-  const DEFAULTS = {
-    warnThreshold: 30000,
-    dangerThreshold: 60000,
-    copyMode: 'latex',
-    showPerMessage: true,
-  };
+  const TOOLKIT = globalThis.CGH_TOOLKIT;
+  const DEFAULTS = TOOLKIT.DEFAULTS;
 
   let settings = { ...DEFAULTS };
   let panel = null;
@@ -31,6 +27,18 @@
   let exportRendering = false;
   let activeExportFormat = null;
   let exportClickListenerBound = false;
+  let activeConversationKey = getConversationKey();
+  let timelineQuery = '';
+  let starredOnly = false;
+  let activeTimelineIndex = -1;
+  let starredSignatures = new Set();
+  let draftInput = null;
+  let draftSaveTimer = null;
+  let draftObserver = null;
+  let generationWasActive = false;
+  let generationPollTimer = null;
+  let shortcutGTimer = null;
+  let shortcutGArmed = '';
   const selectedMessageSignatures = new Set();
   const boundFormulaNodes = new WeakSet();
   const CONVERSATION_READY_QUIET_MS = 500;
@@ -40,6 +48,9 @@
   const AUTO_FOLLOW_BOTTOM_THRESHOLD_PX = 80;
   const SCROLL_SETTLE_QUIET_MS = 180;
   const SCROLL_POSITION_EPSILON = 2;
+  const STAR_STORAGE_KEY = 'cghStarredMessages';
+  const DRAFT_STORAGE_PREFIX = 'cghDraft:';
+  const COMPOSER_SELECTORS = '#prompt-textarea, textarea[data-id="root"], textarea, div[contenteditable="true"].ProseMirror';
 
   const MESSAGE_SELECTORS = [
     '[data-message-author-role]',
@@ -61,10 +72,15 @@
 
   async function init() {
     settings = normalizeSettings(await chrome.storage.sync.get(DEFAULTS));
+    await loadStarredMessages();
     createPanel();
     ensureFormulaUi();
+    applyReadingSettings();
     observeDom();
     attachStorageListener();
+    startDraftSave();
+    attachTimelineShortcuts();
+    startGenerationMonitor();
     scheduleRefresh();
     setInterval(scheduleRefresh, 5000);
   }
@@ -73,24 +89,41 @@
     if (storageListenerAdded) return;
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'sync') return;
-      for (const [key, value] of Object.entries(changes)) {
-        settings[key] = key === 'copyMode' ? normalizeCopyMode(value.newValue) : value.newValue;
-      }
+      const next = { ...settings };
+      for (const [key, value] of Object.entries(changes)) next[key] = value.newValue;
+      settings = normalizeSettings(next);
+      applyReadingSettings();
+      if (settings.draftSaveEnabled) attachDraftInput();
       scheduleRefresh();
     });
     storageListenerAdded = true;
   }
 
   function normalizeSettings(values) {
-    return {
-      ...DEFAULTS,
-      ...values,
-      copyMode: normalizeCopyMode(values.copyMode),
-    };
+    return TOOLKIT.normalizeSettings(values);
   }
 
   function normalizeCopyMode(mode) {
-    return mode === 'markdown' ? 'markdown' : 'latex';
+    return TOOLKIT.normalizeCopyMode(mode);
+  }
+
+  function getConversationKey() {
+    return TOOLKIT.getConversationKey(location.pathname);
+  }
+
+  function syncConversationState() {
+    const conversationKey = getConversationKey();
+    if (conversationKey === activeConversationKey) return;
+    saveDraftNow();
+    activeConversationKey = conversationKey;
+    timelineQuery = '';
+    activeTimelineIndex = -1;
+    selectedMessageSignatures.clear();
+    void loadStarredMessages().then(() => renderTimeline());
+    window.setTimeout(() => {
+      attachDraftInput();
+      void restoreDraft();
+    }, 500);
   }
 
   function observeDom() {
@@ -136,15 +169,16 @@
   }
 
   function refreshAll() {
+    syncConversationState();
     ensurePanelAlive();
     ensureFormulaUi();
     bindFormulaListeners();
     const messages = collectMessages();
     currentMessages = messages;
-    const stats = computeStats(messages);
     syncSelectedMessagesWithCurrent();
-    renderPanel(stats);
+    renderTimeline();
     updateExportUi();
+    attachDraftInput();
   }
 
   function ensurePanelAlive() {
@@ -161,29 +195,29 @@
     panel.classList.add('cgh-hidden');
     panel.innerHTML = `
       <div class="cgh-header">
-        <div class="cgh-title">上下文估算</div>
+        <div class="cgh-title">对话导航</div>
         <div class="cgh-actions">
           <button class="cgh-mini-btn" data-action="refresh">刷新</button>
           <button class="cgh-mini-btn" data-action="toggle">展开</button>
         </div>
       </div>
-      <div class="cgh-main">
-        <div>可见总 token</div><div id="cgh-total">-</div>
-        <div>用户 / 助手</div><div id="cgh-role-total">-</div>
-        <div>消息数</div><div id="cgh-count">-</div>
-        <div>状态</div><div id="cgh-status">-</div>
+      <div class="cgh-timeline-tools">
+        <input id="cgh-search" type="search" placeholder="搜索当前对话" autocomplete="off" />
+        <button class="cgh-icon-btn" data-action="star-filter" type="button" title="仅显示星标" aria-label="仅显示星标" aria-pressed="false">★</button>
       </div>
+      <div class="cgh-list" id="cgh-list"></div>
       <div class="cgh-export">
         <div class="cgh-export-buttons">
-          <button class="cgh-mini-btn" data-action="export-select">选择导出</button>
-          <button class="cgh-mini-btn" data-action="export-png" disabled>导出 PNG</button>
-          <button class="cgh-mini-btn" data-action="export-pdf" disabled>导出 PDF</button>
-          <button class="cgh-mini-btn" data-action="export-print-pdf" disabled>打印 PDF</button>
+          <button class="cgh-mini-btn" data-action="export-select">选择</button>
+          <button class="cgh-mini-btn" data-action="select-all">全选</button>
+          <button class="cgh-mini-btn" data-action="export-png" disabled>PNG</button>
+          <button class="cgh-mini-btn" data-action="export-pdf" disabled>PDF</button>
+          <button class="cgh-mini-btn" data-action="export-markdown" disabled>MD</button>
+          <button class="cgh-mini-btn" data-action="export-print-pdf" disabled>打印</button>
           <button class="cgh-mini-btn" data-action="export-cancel" hidden>取消</button>
         </div>
         <div class="cgh-export-status" id="cgh-export-status">未选择消息</div>
       </div>
-      <div class="cgh-list" id="cgh-list"></div>
     `;
 
     panel.addEventListener('click', (event) => {
@@ -195,14 +229,28 @@
         panel.classList.toggle('cgh-hidden');
         target.textContent = panel.classList.contains('cgh-hidden') ? '展开' : '收起';
       }
+      if (action === 'star-filter') {
+        starredOnly = !starredOnly;
+        target.setAttribute('aria-pressed', String(starredOnly));
+        renderTimeline();
+      }
       if (action === 'export-select') {
         setExportSelectionMode(true);
+      }
+      if (action === 'select-all') {
+        const shouldSelect = selectedMessageSignatures.size !== currentMessages.length;
+        selectedMessageSignatures.clear();
+        if (shouldSelect) currentMessages.forEach(message => selectedMessageSignatures.add(message.signature));
+        updateExportUi();
       }
       if (action === 'export-png') {
         void exportSelectedMessages('png');
       }
       if (action === 'export-pdf') {
         void exportSelectedMessages('pdf');
+      }
+      if (action === 'export-markdown') {
+        void exportSelectedMessages('markdown');
       }
       if (action === 'export-print-pdf') {
         void exportSelectedMessages('print-pdf');
@@ -215,6 +263,10 @@
     document.body.appendChild(panel);
     listContainer = panel.querySelector('#cgh-list');
     listContainer.addEventListener('click', handleMessageListClick);
+    panel.querySelector('#cgh-search').addEventListener('input', (event) => {
+      timelineQuery = event.target.value;
+      renderTimeline();
+    });
     ensureExportSelectionListener();
   }
 
@@ -340,66 +392,42 @@ ${text}\n\
       .trim();
   }
 
-  function computeStats(messages) {
-    let total = 0;
-    let userTotal = 0;
-    let assistantTotal = 0;
-
-    const perMessage = messages.map((message) => {
-      const tokens = estimateTokens(message.text);
-      total += tokens;
-      if (message.role === 'user') userTotal += tokens;
-      else assistantTotal += tokens;
-      return {
-        role: message.role,
-        tokens,
-        preview: message.text.slice(0, 70).replace(/\n/g, ' '),
-      };
-    });
-
-    return {
-      total,
-      userTotal,
-      assistantTotal,
-      count: messages.length,
-      level: getRiskLevel(total),
-      perMessage,
-    };
-  }
-
-  function getRiskLevel(total) {
-    if (total >= settings.dangerThreshold) {
-      return { key: 'danger', label: '建议新建聊天' };
-    }
-    if (total >= settings.warnThreshold) {
-      return { key: 'warn', label: '开始变长' };
-    }
-    return { key: 'ok', label: '正常' };
-  }
-
-  function renderPanel(stats) {
-    panel.querySelector('#cgh-total').textContent = formatNumber(stats.total);
-    panel.querySelector('#cgh-role-total').textContent = `${formatNumber(stats.userTotal)} / ${formatNumber(stats.assistantTotal)}`;
-    panel.querySelector('#cgh-count').textContent = String(stats.count);
-
-    const statusEl = panel.querySelector('#cgh-status');
-    statusEl.innerHTML = `<span class="cgh-pill cgh-${stats.level.key}">${stats.level.label}</span>`;
-
+  function renderTimeline() {
     if (!listContainer) return;
-    if (!settings.showPerMessage) {
-      listContainer.innerHTML = '<div style="font-size:11px;opacity:.75;">已在设置中关闭逐条消息显示</div>';
-      return;
-    }
+    const items = currentMessages
+      .map((message, index) => ({ message, index }))
+      .filter(({ message }) => TOOLKIT.matchesTimelineQuery(message, timelineQuery))
+      .filter(({ message }) => !starredOnly || starredSignatures.has(message.signature));
 
-    listContainer.innerHTML = stats.perMessage
-      .map((item, idx) => `
-        <button type="button" class="cgh-item" data-message-index="${idx}" aria-label="${escapeHtml(`滚动到第 ${idx + 1} 条${item.role === 'user' ? '用户' : '助手'}消息`)}">
-          <div class="cgh-role">${item.role === 'user' ? '用户' : '助手'}</div>
-          <div class="cgh-preview">${escapeHtml(`${idx + 1}. ${item.preview}`)}</div>
-          <div class="cgh-token">${formatNumber(item.tokens)}</div>
-        </button>
-      `)
-      .join('') || '<div style="font-size:11px;opacity:.75;">未检测到消息</div>';
+    listContainer.innerHTML = items.map(({ message, index }) => {
+      const starred = starredSignatures.has(message.signature);
+      const selected = selectedMessageSignatures.has(message.signature);
+      const preview = message.text.slice(0, 96).replace(/\s+/g, ' ');
+      return `
+        <div class="cgh-item${selected ? ' cgh-item-selected' : ''}${index === activeTimelineIndex ? ' cgh-item-active' : ''}" data-message-index="${index}">
+          <button type="button" class="cgh-star-btn${starred ? ' cgh-starred' : ''}" data-action="toggle-star" title="${starred ? '取消星标' : '添加星标'}" aria-label="${starred ? '取消星标' : '添加星标'}" aria-pressed="${starred}">★</button>
+          <button type="button" class="cgh-jump-btn" data-action="jump-message" aria-label="跳转到第 ${index + 1} 条消息">
+            <span class="cgh-role">${message.role === 'user' ? '你' : 'GPT'}</span>
+            <span class="cgh-preview">${escapeHtml(`${index + 1}. ${preview}`)}</span>
+          </button>
+        </div>`;
+    }).join('') || '<div class="cgh-empty">没有匹配的消息</div>';
+  }
+
+  async function loadStarredMessages() {
+    const data = await chrome.storage.local.get(STAR_STORAGE_KEY);
+    const allStars = data[STAR_STORAGE_KEY] || {};
+    starredSignatures = new Set(Array.isArray(allStars[activeConversationKey]) ? allStars[activeConversationKey] : []);
+  }
+
+  async function saveStarredMessages() {
+    const data = await chrome.storage.local.get(STAR_STORAGE_KEY);
+    const allStars = data[STAR_STORAGE_KEY] && typeof data[STAR_STORAGE_KEY] === 'object'
+      ? data[STAR_STORAGE_KEY]
+      : {};
+    if (starredSignatures.size) allStars[activeConversationKey] = [...starredSignatures];
+    else delete allStars[activeConversationKey];
+    await chrome.storage.local.set({ [STAR_STORAGE_KEY]: allStars });
   }
 
   function handleMessageListClick(event) {
@@ -414,12 +442,23 @@ ${text}\n\
 
     event.preventDefault();
     event.stopPropagation();
+    if (target.closest('[data-action="toggle-star"]')) {
+      const message = currentMessages[index];
+      if (!message) return;
+      if (starredSignatures.has(message.signature)) starredSignatures.delete(message.signature);
+      else starredSignatures.add(message.signature);
+      void saveStarredMessages();
+      renderTimeline();
+      return;
+    }
     if (exportSelectionMode) {
       toggleMessageSelection(index);
       return;
     }
 
+    activeTimelineIndex = index;
     queueMessageJump(index);
+    renderTimeline();
   }
 
   function ensureExportSelectionListener() {
@@ -495,25 +534,34 @@ ${text}\n\
     const selectBtn = panel.querySelector('[data-action="export-select"]');
     const exportPngBtn = panel.querySelector('[data-action="export-png"]');
     const exportPdfBtn = panel.querySelector('[data-action="export-pdf"]');
+    const exportMarkdownBtn = panel.querySelector('[data-action="export-markdown"]');
     const exportPrintPdfBtn = panel.querySelector('[data-action="export-print-pdf"]');
+    const selectAllBtn = panel.querySelector('[data-action="select-all"]');
     const cancelBtn = panel.querySelector('[data-action="export-cancel"]');
     const statusEl = panel.querySelector('#cgh-export-status');
     const selectedCount = selectedMessageSignatures.size;
 
     if (selectBtn instanceof HTMLButtonElement) {
-      selectBtn.textContent = exportSelectionMode ? '继续选择' : '选择导出';
+      selectBtn.textContent = exportSelectionMode ? '选择中' : '选择';
+    }
+    if (selectAllBtn instanceof HTMLButtonElement) {
+      selectAllBtn.textContent = currentMessages.length > 0 && selectedCount === currentMessages.length ? '清空' : '全选';
     }
     if (exportPngBtn instanceof HTMLButtonElement) {
       exportPngBtn.disabled = selectedCount === 0 || exportRendering;
-      exportPngBtn.textContent = exportRendering && activeExportFormat === 'png' ? '导出中...' : '导出 PNG';
+      exportPngBtn.textContent = exportRendering && activeExportFormat === 'png' ? '处理中' : 'PNG';
     }
     if (exportPdfBtn instanceof HTMLButtonElement) {
       exportPdfBtn.disabled = selectedCount === 0 || exportRendering;
-      exportPdfBtn.textContent = exportRendering && activeExportFormat === 'pdf' ? '导出中...' : '导出 PDF';
+      exportPdfBtn.textContent = exportRendering && activeExportFormat === 'pdf' ? '处理中' : 'PDF';
+    }
+    if (exportMarkdownBtn instanceof HTMLButtonElement) {
+      exportMarkdownBtn.disabled = selectedCount === 0 || exportRendering;
+      exportMarkdownBtn.textContent = exportRendering && activeExportFormat === 'markdown' ? '处理中' : 'MD';
     }
     if (exportPrintPdfBtn instanceof HTMLButtonElement) {
       exportPrintPdfBtn.disabled = selectedCount === 0 || exportRendering;
-      exportPrintPdfBtn.textContent = exportRendering && activeExportFormat === 'print-pdf' ? '准备中...' : '打印 PDF';
+      exportPrintPdfBtn.textContent = exportRendering && activeExportFormat === 'print-pdf' ? '准备中' : '打印';
     }
     if (cancelBtn instanceof HTMLButtonElement) {
       cancelBtn.hidden = !exportSelectionMode && selectedCount === 0;
@@ -541,11 +589,12 @@ ${text}\n\
       item.classList.toggle('cgh-item-selected', selected);
       item.setAttribute('aria-pressed', selected ? 'true' : 'false');
     });
+    renderTimeline();
   }
 
   async function exportSelectedMessages(format = 'png') {
     if (exportRendering) return;
-    const exportFormat = format === 'pdf' ? 'pdf' : (format === 'print-pdf' ? 'print-pdf' : 'png');
+    const exportFormat = ['pdf', 'print-pdf', 'markdown'].includes(format) ? format : 'png';
     const exportLabel = exportFormat === 'print-pdf' ? '打印 PDF' : exportFormat.toUpperCase();
 
     currentMessages = collectMessages();
@@ -567,6 +616,12 @@ ${text}\n\
       if (exportFormat === 'print-pdf') {
         await exportSelectedMessagesAsPrintPdf(selectedMessages);
         showToast('已打开打印窗口，请选择保存为 PDF', 4000);
+        return;
+      }
+      if (exportFormat === 'markdown') {
+        const markdown = buildMessagesMarkdown(selectedMessages);
+        downloadBlob(new Blob([markdown], { type: 'text/markdown;charset=utf-8' }), buildExportFilename(0, 1, 'md'));
+        showToast(`已导出 ${selectedMessages.length} 条消息`);
         return;
       }
 
@@ -609,6 +664,80 @@ ${text}\n\
       activeExportFormat = null;
       updateExportUi();
     }
+  }
+
+  function buildMessagesMarkdown(messages) {
+    const sections = messages.map((message, index) => {
+      const role = message.role === 'user' ? '用户' : 'ChatGPT';
+      const contentRoot = findMessageContentNode(message.node) || message.node;
+      const content = domToMarkdown(contentRoot).trim() || message.text.trim();
+      return `## ${index + 1}. ${role}\n\n${content}`;
+    });
+    return `# ChatGPT 对话摘录\n\n> 导出时间：${formatExportDate(new Date())}\n\n${sections.join('\n\n---\n\n')}\n`;
+  }
+
+  function domToMarkdown(root) {
+    const clone = root.cloneNode(true);
+    clone.querySelectorAll('button, script, style, svg, #cgh-panel, #cgh-toast').forEach(node => node.remove());
+    clone.querySelectorAll(FORMULA_SELECTORS).forEach((formula) => {
+      if (!formula.parentNode || formula.parentElement?.closest(FORMULA_SELECTORS)) return;
+      const latex = extractLatexFromNode(formula);
+      if (!latex) return;
+      formula.replaceWith(document.createTextNode(isDisplayFormula(formula) ? `\n\n$$${normalizeLatexForMarkdown(latex)}$$\n\n` : `$${normalizeLatexForMarkdown(latex)}$`));
+    });
+    return markdownFromNode(clone)
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function markdownFromNode(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+    if (!(node instanceof Element)) return '';
+
+    const tag = node.tagName.toLowerCase();
+    const children = () => [...node.childNodes].map(markdownFromNode).join('');
+    if (tag === 'br') return '\n';
+    if (/^h[1-6]$/.test(tag)) return `${'#'.repeat(Number(tag[1]))} ${children().trim()}\n\n`;
+    if (tag === 'p') return `${children().trim()}\n\n`;
+    if (tag === 'strong' || tag === 'b') return `**${children().trim()}**`;
+    if (tag === 'em' || tag === 'i') return `*${children().trim()}*`;
+    if (tag === 'del' || tag === 's') return `~~${children().trim()}~~`;
+    if (tag === 'code' && node.parentElement?.tagName.toLowerCase() !== 'pre') return `\`${children().trim()}\``;
+    if (tag === 'pre') {
+      const code = node.querySelector('code');
+      const language = [...(code?.classList || [])].find(name => name.startsWith('language-'))?.slice(9) || '';
+      return `\n\n\`\`\`${language}\n${(code?.textContent || node.textContent || '').trimEnd()}\n\`\`\`\n\n`;
+    }
+    if (tag === 'blockquote') {
+      return `${children().trim().split('\n').map(line => `> ${line}`).join('\n')}\n\n`;
+    }
+    if (tag === 'ul' || tag === 'ol') {
+      return `${[...node.children].filter(child => child.tagName.toLowerCase() === 'li').map((item, index) => `${tag === 'ol' ? `${index + 1}.` : '-'} ${markdownFromNode(item).trim()}`).join('\n')}\n\n`;
+    }
+    if (tag === 'li') return children();
+    if (tag === 'a') {
+      const label = children().trim() || node.getAttribute('href') || '';
+      return node.getAttribute('href') ? `[${label}](${node.getAttribute('href')})` : label;
+    }
+    if (tag === 'img') {
+      const src = node.getAttribute('src') || '';
+      return src ? `![${node.getAttribute('alt') || '图片'}](${src})` : '';
+    }
+    if (tag === 'table') return tableToMarkdown(node);
+    const content = children();
+    return ['div', 'section', 'article'].includes(tag) ? `${content}\n` : content;
+  }
+
+  function tableToMarkdown(table) {
+    const rows = [...table.querySelectorAll('tr')].map(row =>
+      [...row.querySelectorAll(':scope > th, :scope > td')].map(cell =>
+        (cell.textContent || '').trim().replace(/\|/g, '\\|').replace(/\s+/g, ' ')));
+    if (!rows.length) return '';
+    const width = Math.max(...rows.map(row => row.length));
+    const normalized = rows.map(row => [...row, ...Array(Math.max(0, width - row.length)).fill('')]);
+    const header = normalized[0];
+    return `\n\n| ${header.join(' | ')} |\n| ${header.map(() => '---').join(' | ')} |\n${normalized.slice(1).map(row => `| ${row.join(' | ')} |`).join('\n')}\n\n`;
   }
 
   async function exportSelectedMessagesAsPrintPdf(messages) {
@@ -1112,9 +1241,36 @@ ${text}\n\
 
     const images = [...doc.images];
     await Promise.all(images.map(img => waitForPrintImage(img, view)));
-    await new Promise(resolve => view.requestAnimationFrame
-      ? view.requestAnimationFrame(() => view.requestAnimationFrame(resolve))
-      : view.setTimeout(resolve, 120));
+    await waitForAnimationFrames(view);
+  }
+
+  function waitForAnimationFrames(view, frameCount = 2, timeoutMs = 250) {
+    return new Promise(resolve => {
+      let settled = false;
+      let remainingFrames = frameCount;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        view.clearTimeout(timeoutId);
+        resolve();
+      };
+      const timeoutId = view.setTimeout(finish, timeoutMs);
+
+      if (typeof view.requestAnimationFrame !== 'function') {
+        return;
+      }
+
+      const onFrame = () => {
+        remainingFrames -= 1;
+        if (remainingFrames <= 0) {
+          finish();
+          return;
+        }
+        view.requestAnimationFrame(onFrame);
+      };
+
+      view.requestAnimationFrame(onFrame);
+    });
   }
 
   function waitForPrintImage(img, view) {
@@ -2569,10 +2725,6 @@ ${text}\n\
     return Math.abs(nodeCenter - viewportCenter) <= tolerance;
   }
 
-  function clamp(value, min, max) {
-    return Math.min(Math.max(value, min), max);
-  }
-
   function isNodeVisibleEnough(node) {
     if (!(node instanceof Element)) return false;
 
@@ -2586,9 +2738,10 @@ ${text}\n\
   }
 
   async function waitForLayoutStability(delayMs = 120) {
+    if (document.visibilityState === 'hidden') return;
     await new Promise(resolve => window.setTimeout(resolve, delayMs));
-    await new Promise(resolve => requestAnimationFrame(() => resolve()));
-    await new Promise(resolve => requestAnimationFrame(() => resolve()));
+    if (document.visibilityState === 'hidden') return;
+    await waitForAnimationFrames(window);
   }
 
   function highlightMessageNode(node) {
@@ -2615,44 +2768,192 @@ ${text}\n\
     }, 1800);
   }
 
-  function formatNumber(value) {
-    return new Intl.NumberFormat('zh-CN').format(value);
+  function applyReadingSettings() {
+    document.documentElement.classList.toggle('cgh-reading-enabled', settings.readingEnabled);
+    document.documentElement.style.setProperty('--cgh-reading-width', `${settings.readingWidth}px`);
+    document.documentElement.style.setProperty('--cgh-font-scale', String(settings.fontScale / 100));
+    document.documentElement.style.setProperty('--cgh-line-height', String(settings.lineHeight));
+    document.documentElement.style.setProperty('--cgh-paragraph-spacing', `${settings.paragraphSpacing}em`);
   }
 
-  function escapeHtml(text) {
-    return text
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#039;');
+  function findComposer() {
+    for (const selector of COMPOSER_SELECTORS.split(',').map(value => value.trim())) {
+      const match = [...document.querySelectorAll(selector)].find(element => {
+        if (!(element instanceof HTMLElement)) return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      if (match) return match;
+    }
+    return null;
   }
 
-  function estimateTokens(text) {
-    if (!text) return 0;
+  function readComposerText(input) {
+    if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) return input.value;
+    return input.innerText || input.textContent || '';
+  }
 
-    let tokens = 0;
+  function insertIntoComposer(text, replace = false) {
+    const input = findComposer();
+    if (!input) return false;
+    input.focus();
 
-    const cjkMatches = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu) || [];
-    tokens += cjkMatches.length;
-
-    const asciiText = text.replace(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu, ' ');
-    const segments = asciiText.match(/[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:\.\d+)?|\S/gu) || [];
-
-    for (const segment of segments) {
-      if (/^[A-Za-z]+(?:'[A-Za-z]+)?$/.test(segment)) {
-        tokens += Math.max(1, Math.ceil(segment.length / 4));
-      } else if (/^\d+(?:\.\d+)?$/.test(segment)) {
-        tokens += Math.max(1, Math.ceil(segment.length / 3));
-      } else {
-        tokens += 1;
+    if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
+      const existing = replace ? '' : input.value;
+      const prefix = existing && !existing.endsWith('\n') ? '\n\n' : '';
+      input.value = `${existing}${prefix}${text}`;
+      input.selectionStart = input.selectionEnd = input.value.length;
+    } else {
+      if (replace) input.textContent = '';
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(input);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      const prefix = !replace && readComposerText(input).trim() ? '\n\n' : '';
+      if (!document.execCommand('insertText', false, `${prefix}${text}`)) {
+        input.appendChild(document.createTextNode(`${prefix}${text}`));
       }
     }
 
-    const newlineCount = (text.match(/\n/g) || []).length;
-    tokens += Math.ceil(newlineCount * 0.2);
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    return true;
+  }
 
-    return tokens;
+  function startDraftSave() {
+    attachDraftInput();
+    draftObserver = new MutationObserver(() => attachDraftInput());
+    draftObserver.observe(document.body, { childList: true, subtree: true });
+    window.addEventListener('beforeunload', saveDraftNow);
+    document.addEventListener('keydown', handleDraftSendKey, true);
+    document.addEventListener('click', handleDraftSendClick, true);
+    window.setTimeout(() => void restoreDraft(), 450);
+  }
+
+  function handleDraftSendKey(event) {
+    if (!settings.draftSaveEnabled || event.isComposing || event.key !== 'Enter' || event.shiftKey) return;
+    if (!(event.target instanceof Element) || !event.target.closest(COMPOSER_SELECTORS)) return;
+    scheduleDraftClear(activeConversationKey);
+  }
+
+  function handleDraftSendClick(event) {
+    if (!settings.draftSaveEnabled || !(event.target instanceof Element)) return;
+    if (!event.target.closest('button[data-testid="send-button"], button[aria-label*="Send" i], button[aria-label*="发送"]')) return;
+    scheduleDraftClear(activeConversationKey);
+  }
+
+  function scheduleDraftClear(conversationKey) {
+    window.clearTimeout(draftSaveTimer);
+    window.setTimeout(() => void chrome.storage.local.remove(`${DRAFT_STORAGE_PREFIX}${conversationKey}`), 800);
+  }
+
+  function attachDraftInput() {
+    const input = findComposer();
+    if (!input || input === draftInput) return;
+    draftInput?.removeEventListener('input', scheduleDraftSave);
+    draftInput = input;
+    draftInput.addEventListener('input', scheduleDraftSave);
+  }
+
+  function scheduleDraftSave() {
+    if (!settings.draftSaveEnabled) return;
+    window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = window.setTimeout(saveDraftNow, 350);
+  }
+
+  function saveDraftNow() {
+    if (!settings.draftSaveEnabled || !draftInput) return;
+    const key = `${DRAFT_STORAGE_PREFIX}${activeConversationKey}`;
+    const text = readComposerText(draftInput).trimEnd();
+    if (text.trim()) {
+      void chrome.storage.local.set({ [key]: { text, updatedAt: Date.now() } });
+    } else {
+      void chrome.storage.local.remove(key);
+    }
+  }
+
+  async function restoreDraft() {
+    if (!settings.draftSaveEnabled) return;
+    attachDraftInput();
+    if (!draftInput || readComposerText(draftInput).trim()) return;
+    const key = `${DRAFT_STORAGE_PREFIX}${activeConversationKey}`;
+    const data = await chrome.storage.local.get(key);
+    const draft = data[key];
+    if (!draft?.text || Date.now() - Number(draft.updatedAt || 0) > 30 * 24 * 60 * 60 * 1000) {
+      if (draft) await chrome.storage.local.remove(key);
+      return;
+    }
+    insertIntoComposer(draft.text, true);
+  }
+
+  function startGenerationMonitor() {
+    window.clearInterval(generationPollTimer);
+    generationPollTimer = window.setInterval(() => {
+      const active = isGenerationActive();
+      if (generationWasActive && !active && settings.notificationsEnabled && document.hidden) {
+        void chrome.runtime.sendMessage({
+          type: 'cgh-response-complete',
+          title: document.title.replace(/\s*[-|]\s*ChatGPT\s*$/i, '') || '当前对话',
+        });
+      }
+      generationWasActive = active;
+    }, 800);
+  }
+
+  function isGenerationActive() {
+    if (document.querySelector('[data-testid="stop-button"], button[data-testid*="stop"]')) return true;
+    return [...document.querySelectorAll('button')].some(button =>
+      /stop generating|stop streaming|停止生成|停止回答/i.test(button.getAttribute('aria-label') || button.textContent || ''));
+  }
+
+  function attachTimelineShortcuts() {
+    document.addEventListener('keydown', event => {
+      if (!settings.shortcutsEnabled || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+
+      if (event.key === 'g' || (event.key === 'G' && event.shiftKey)) {
+        event.preventDefault();
+        if (shortcutGArmed === event.key) {
+          shortcutGArmed = '';
+          window.clearTimeout(shortcutGTimer);
+          jumpByShortcut(event.key === 'g' ? 0 : currentMessages.length - 1);
+        } else {
+          shortcutGArmed = event.key;
+          window.clearTimeout(shortcutGTimer);
+          shortcutGTimer = window.setTimeout(() => { shortcutGArmed = ''; }, 650);
+        }
+        return;
+      }
+      if (event.key !== 'j' && event.key !== 'k') return;
+      event.preventDefault();
+      const nearest = getNearestMessageIndex();
+      jumpByShortcut(clamp(nearest + (event.key === 'j' ? 1 : -1), 0, currentMessages.length - 1));
+    }, true);
+  }
+
+  function getNearestMessageIndex() {
+    if (activeTimelineIndex >= 0 && activeTimelineIndex < currentMessages.length) return activeTimelineIndex;
+    const center = window.innerHeight / 2;
+    let bestIndex = 0;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    currentMessages.forEach((message, index) => {
+      const rect = message.node.getBoundingClientRect();
+      const distance = Math.abs(rect.top + rect.height / 2 - center);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    });
+    return bestIndex;
+  }
+
+  function jumpByShortcut(index) {
+    if (!currentMessages.length || index < 0) return;
+    activeTimelineIndex = index;
+    queueMessageJump(index);
+    renderTimeline();
   }
 
   function bindFormulaListeners() {
@@ -2698,7 +2999,7 @@ ${text}\n\
     if (!latex) return;
 
     hideFormulaUi();
-    await copyFormulaText(latex, isDisplayFormula(node), settings.copyMode);
+    await copyFormulaText(latex, isDisplayFormula(node), settings.copyMode, node);
   }
 
   function isDisplayFormula(node) {
@@ -2771,30 +3072,37 @@ ${text}\n\
     const menu = formulaMenu;
     menu.innerHTML = '';
 
-    const modeLabels = { latex: 'LaTeX', markdown: 'Markdown' };
+    const modeLabels = { latex: 'LaTeX', markdown: 'Markdown', word: 'MathML / Word' };
     const defaultCopyMode = normalizeCopyMode(settings.copyMode);
     const quickBtn = document.createElement('button');
     quickBtn.textContent = `按默认格式复制（${modeLabels[defaultCopyMode]}）`;
     quickBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, defaultCopyMode);
+      await copyFormulaText(latex, displayMode, defaultCopyMode, anchor);
       hideFormulaUi();
     });
 
     const latexBtn = document.createElement('button');
     latexBtn.textContent = '复制 LaTeX';
     latexBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, 'latex');
+      await copyFormulaText(latex, displayMode, 'latex', anchor);
       hideFormulaUi();
     });
 
     const markdownBtn = document.createElement('button');
     markdownBtn.textContent = '复制 Markdown';
     markdownBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, 'markdown');
+      await copyFormulaText(latex, displayMode, 'markdown', anchor);
       hideFormulaUi();
     });
 
-    menu.append(quickBtn, latexBtn, markdownBtn);
+    const wordBtn = document.createElement('button');
+    wordBtn.textContent = '复制 MathML / Word';
+    wordBtn.addEventListener('click', async () => {
+      await copyFormulaText(latex, displayMode, 'word', anchor);
+      hideFormulaUi();
+    });
+
+    menu.append(quickBtn, latexBtn, markdownBtn, wordBtn);
     menu.hidden = false;
     menu.style.display = 'block';
     menu.style.visibility = 'hidden';
@@ -2858,10 +3166,16 @@ ${text}\n\
     return Math.min(Math.max(value, min), max);
   }
 
-  async function copyFormulaText(latex, displayMode, mode) {
+  async function copyFormulaText(latex, displayMode, mode, sourceNode = null) {
     let text;
     let label;
-    if (normalizeCopyMode(mode) === 'markdown') {
+    const normalizedMode = normalizeCopyMode(mode);
+    if (normalizedMode === 'word') {
+      await copyFormulaForWord(sourceNode, latex);
+      showToast('已复制 MathML / Word');
+      return;
+    }
+    if (normalizedMode === 'markdown') {
       text = formatMarkdownFormula(latex, displayMode);
       label = 'Markdown';
     } else {
@@ -2870,6 +3184,26 @@ ${text}\n\
     }
     await copyText(text);
     showToast(`已复制 ${label}`);
+  }
+
+  async function copyFormulaForWord(sourceNode, latex) {
+    const math = sourceNode?.matches?.('math')
+      ? sourceNode
+      : sourceNode?.querySelector?.('math, mjx-assistive-mml math');
+    if (!math || typeof ClipboardItem !== 'function' || !navigator.clipboard?.write) {
+      await copyText(normalizeLatexForCopy(latex));
+      return;
+    }
+
+    const clone = math.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/1998/Math/MathML');
+    const html = `<html><body>${clone.outerHTML}</body></html>`;
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        'text/html': new Blob([html], { type: 'text/html' }),
+        'text/plain': new Blob([normalizeLatexForCopy(latex)], { type: 'text/plain' }),
+      }),
+    ]);
   }
 
   function normalizeLatexForCopy(latex) {

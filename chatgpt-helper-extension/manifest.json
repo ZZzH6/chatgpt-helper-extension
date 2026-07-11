@@ -1,17 +1,27 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Context Helper",
-  "version": "1.3.1",
-  "description": "Estimate visible token usage in ChatGPT, copy formulas, and export selected conversations as PNG, image PDF, or printable PDF.",
-  "permissions": ["storage", "clipboardWrite"],
+  "name": "ChatGPT Reading Toolkit",
+  "version": "2.0.0",
+  "description": "Navigate, save, format, and export ChatGPT conversations.",
+  "permissions": ["storage", "clipboardWrite", "notifications"],
+  "icons": {
+    "16": "icon.png",
+    "32": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",
     "https://chat.openai.com/*"
   ],
   "action": {
-    "default_title": "ChatGPT Context Helper",
+    "default_title": "ChatGPT Reading Toolkit",
+    "default_icon": "icon.png",
     "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
@@ -20,7 +30,7 @@
         "https://*.chatgpt.com/*",
         "https://chat.openai.com/*"
       ],
-      "js": ["content.js"],
+      "js": ["toolkit-utils.js", "content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle"
     }
