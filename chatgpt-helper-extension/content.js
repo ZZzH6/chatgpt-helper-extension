@@ -741,16 +741,8 @@ ${text}\n\
   }
 
   async function exportSelectedMessagesAsPrintPdf(messages) {
-    const printWindow = window.open('', '_blank');
-    if (!printWindow) {
-      throw new Error('浏览器阻止了打印窗口，请允许此站点弹出窗口后重试');
-    }
-
-    printWindow.document.open();
-    printWindow.document.write(buildPrintLoadingHtml());
-    printWindow.document.close();
-
     let container = null;
+    let printFrame = null;
     try {
       container = buildPrintPdfContainer(messages);
       container.style.position = 'fixed';
@@ -768,24 +760,75 @@ ${text}\n\
       const title = buildPrintPdfTitle();
       const html = buildPrintPdfHtml(container.innerHTML, title);
 
-      printWindow.document.open();
-      printWindow.document.write(html);
-      printWindow.document.close();
-      await waitForPrintWindowReady(printWindow);
-      printWindow.focus();
-      printWindow.print();
-    } catch (error) {
-      try {
-        if (!printWindow.closed) {
-          printWindow.document.body.innerHTML = `<pre style="white-space:pre-wrap;font:14px sans-serif;color:#b91c1c;">打印 PDF 准备失败：${escapeHtml(getErrorMessage(error))}</pre>`;
-        }
-      } catch (renderError) {
-        // Ignore secondary print-window rendering failures.
+      printFrame = await createPrintFrame(html);
+      const printWindow = printFrame.contentWindow;
+      if (!printWindow) {
+        throw new Error('浏览器无法创建打印页面，请刷新后重试');
       }
-      throw error;
+
+      await waitForPrintWindowReady(printWindow);
+      await printFromFrame(printWindow);
     } finally {
+      printFrame?.remove();
       container?.remove();
     }
+  }
+
+  function createPrintFrame(html) {
+    return new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe');
+      frame.className = 'cgh-print-frame';
+      frame.title = 'ChatGPT 对话摘录打印页面';
+      frame.setAttribute('aria-hidden', 'true');
+      frame.style.position = 'fixed';
+      frame.style.left = '-10000px';
+      frame.style.top = '0';
+      frame.style.width = '794px';
+      frame.style.height = '1123px';
+      frame.style.border = '0';
+      frame.style.opacity = '0';
+      frame.style.pointerEvents = 'none';
+
+      let settled = false;
+      const finish = (callback) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        callback();
+      };
+      const timeoutId = window.setTimeout(() => {
+        finish(() => {
+          frame.remove();
+          reject(new Error('打印页面加载超时，请重试'));
+        });
+      }, 3000);
+
+      frame.addEventListener('load', () => finish(() => resolve(frame)), { once: true });
+      frame.addEventListener('error', () => finish(() => {
+        frame.remove();
+        reject(new Error('打印页面加载失败，请重试'));
+      }), { once: true });
+      frame.srcdoc = html;
+      document.body.appendChild(frame);
+    });
+  }
+
+  async function printFromFrame(printWindow) {
+    window.focus();
+    printWindow.focus();
+
+    // Let Chromium commit the frame focus before opening its modal print UI.
+    await waitForAnimationFrames(printWindow, 2, 300);
+    await new Promise((resolve, reject) => {
+      printWindow.setTimeout(() => {
+        try {
+          printWindow.print();
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      }, 50);
+    });
   }
 
   function buildPrintPdfContainer(messages) {
@@ -828,17 +871,6 @@ ${text}\n\
     }
 
     return container;
-  }
-
-  function buildPrintLoadingHtml() {
-    return `<!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>准备打印 PDF</title>
-        </head>
-        <body style="font:14px sans-serif;color:#111827;padding:24px;">正在准备打印 PDF...</body>
-      </html>`;
   }
 
   function buildPrintPdfHtml(contentHtml, title) {
@@ -993,6 +1025,23 @@ ${text}\n\
         font-size: 13pt;
         line-height: 1.65;
         text-align: left;
+        max-width: 100%;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .cgh-print-content > *,
+      .cgh-print-content .markdown > * {
+        max-width: 100% !important;
+        min-width: 0 !important;
+      }
+
+      .cgh-print-content * {
+        max-width: 100% !important;
+        min-width: 0 !important;
+        overflow: visible !important;
+        overflow-x: visible !important;
+        overflow-y: visible !important;
       }
 
       .cgh-print-content p {
@@ -1045,9 +1094,14 @@ ${text}\n\
         font-family: Consolas, "Courier New", monospace;
         font-size: 9.8pt;
         line-height: 1.55;
+        max-width: 100%;
+        min-width: 0;
         white-space: pre-wrap;
         word-break: break-word;
-        overflow: visible;
+        overflow-wrap: anywhere;
+        overflow: visible !important;
+        overflow-x: visible !important;
+        overflow-y: visible !important;
         text-align: left;
         text-indent: 0;
         break-inside: avoid;
@@ -1133,6 +1187,32 @@ ${text}\n\
         padding: 0;
         overflow: visible;
         text-align: center;
+      }
+
+      .cgh-print-content .cgh-export-overflow-wrap {
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        height: auto !important;
+        max-height: none !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+        overflow: visible !important;
+        overflow-x: visible !important;
+        overflow-y: visible !important;
+        white-space: normal !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+        break-inside: auto !important;
+        page-break-inside: auto !important;
+        scrollbar-width: none !important;
+        -ms-overflow-style: none !important;
+      }
+
+      .cgh-print-content .cgh-export-overflow-wrap::-webkit-scrollbar {
+        display: none !important;
+        width: 0 !important;
+        height: 0 !important;
       }
 
       .cgh-print-content .katex .katex-mathml,
@@ -1461,6 +1541,7 @@ ${text}\n\
 
   function normalizeExportContent(root) {
     normalizeExportTables(root);
+    normalizeExportOverflow(root);
 
     root.querySelectorAll('pre').forEach((pre) => {
       pre.classList.add('cgh-export-code-block');
@@ -1480,6 +1561,48 @@ ${text}\n\
       img.decoding = 'sync';
       img.referrerPolicy = 'no-referrer';
     });
+  }
+
+  function normalizeExportOverflow(root) {
+    const elements = [root, ...root.querySelectorAll('*')];
+
+    for (const element of elements) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (element.matches('table, th, td, img, svg, math, .katex, mjx-container')) continue;
+      if (!element.matches('pre') && !hasExportOverflowBehavior(element)) continue;
+      element.classList.add('cgh-export-overflow-wrap');
+      element.style.setProperty('max-width', '100%', 'important');
+      element.style.setProperty('min-width', '0', 'important');
+      element.style.setProperty('height', 'auto', 'important');
+      element.style.setProperty('max-height', 'none', 'important');
+      element.style.setProperty('overflow', 'visible', 'important');
+      element.style.setProperty('overflow-x', 'visible', 'important');
+      element.style.setProperty('overflow-y', 'visible', 'important');
+      element.style.setProperty('overflow-wrap', 'anywhere', 'important');
+      element.style.setProperty('word-break', 'break-word', 'important');
+      if (element.matches('pre, code')) {
+        element.style.setProperty('white-space', 'pre-wrap', 'important');
+      } else {
+        element.style.setProperty('white-space', 'normal', 'important');
+      }
+    }
+  }
+
+  function hasExportOverflowBehavior(element) {
+    const className = typeof element.className === 'string' ? element.className : '';
+    const inlineStyle = element.getAttribute('style') || '';
+    const hints = `${className} ${inlineStyle}`;
+
+    if (/(?:overflow(?:-[xy])?(?:-|\s*:\s*(?:auto|scroll|overlay|hidden))|scrollbar|whitespace-(?:nowrap|pre|pre-wrap|break-spaces)|text-nowrap|break-keep|white-space\s*:\s*(?:nowrap|pre|pre-wrap)|max-w-max|w-max)/i.test(hints)) {
+      return true;
+    }
+
+    const style = window.getComputedStyle(element);
+    return /(auto|scroll|overlay|hidden)/.test(`${style.overflow} ${style.overflowX} ${style.overflowY}`) ||
+      style.whiteSpace === 'nowrap' ||
+      style.width === 'max-content' ||
+      style.width === 'fit-content' ||
+      style.minWidth === 'max-content';
   }
 
   function normalizeExportTables(root) {

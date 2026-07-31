@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>研究笔记 - ChatGPT</title>
+    <style>
+      body { margin: 0; color: #ececec; background: #212121; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+      main { width: min(860px, calc(100% - 40px)); margin: 0 auto; padding: 48px 0 180px; }
+      article { margin-bottom: 34px; }
+      [data-message-author-role="user"] { width: 72%; margin-left: auto; padding: 14px 18px; border-radius: 14px; background: #303030; }
+      [data-message-author-role="assistant"] { line-height: 1.7; }
+      pre { overflow: auto; padding: 14px; border-radius: 8px; background: #111; }
+      #composer-shell { position: fixed; right: 0; bottom: 0; left: 0; padding: 18px; background: linear-gradient(transparent, #212121 35%); }
+      #prompt-textarea { width: min(760px, calc(100% - 40px)); min-height: 46px; margin: auto; padding: 12px; border: 1px solid #555; border-radius: 12px; background: #303030; }
+    </style>
+    <script>
+      const localData = {};
+      function readStore(store, keys) {
+        if (keys == null) return { ...store };
+        if (typeof keys === 'string') return { [keys]: store[keys] };
+        if (Array.isArray(keys)) return Object.fromEntries(keys.map(key => [key, store[key]]));
+        return { ...keys, ...Object.fromEntries(Object.keys(keys).filter(key => key in store).map(key => [key, store[key]])) };
+      }
+      globalThis.chrome = {
+        storage: {
+          sync: {
+            get: async keys => readStore({}, keys),
+            set: async () => {},
+          },
+          local: {
+            get: async keys => readStore(localData, keys),
+            set: async values => Object.assign(localData, values),
+            remove: async keys => { for (const key of [].concat(keys)) delete localData[key]; },
+          },
+          onChanged: { addListener: () => {} },
+        },
+        runtime: { sendMessage: async () => {} },
+      };
+    </script>
+    <link rel="stylesheet" href="../chatgpt-helper-extension/styles.css" />
+  </head>
+  <body>
+    <main>
+      <article data-message-author-role="user">
+        请整理扩展中最适合论文资料处理的功能，并给出实现顺序。
+      </article>
+      <article data-message-author-role="assistant">
+        <div class="markdown">
+          <h2>建议顺序</h2>
+          <p>先完成对话导航、星标和 Markdown 导出，再加入草稿自动保存。</p>
+          <ol><li>时间线搜索</li><li>重点消息星标</li><li>多格式导出</li></ol>
+          <pre><code class="language-js">const priority = ['timeline', 'star', 'export'];</code></pre>
+        </div>
+      </article>
+      <article data-message-author-role="user">
+        公式也需要适合 Word，例如 E = mc²。
+      </article>
+      <article data-message-author-role="assistant">
+        <div class="markdown">
+          <p>可以同时保留 LaTeX、Markdown 和 MathML。</p>
+          <span class="katex"><math alttext="E = mc^2"><semantics><mrow><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">E = mc^2</annotation></semantics></math></span>
+        </div>
+      </article>
+    </main>
+    <div id="composer-shell"><div id="prompt-textarea" class="ProseMirror" contenteditable="true"><p><br /></p></div></div>
+    <script src="../chatgpt-helper-extension/toolkit-utils.js"></script>
+    <script src="../chatgpt-helper-extension/content.js"></script>
+  </body>
+</html>
