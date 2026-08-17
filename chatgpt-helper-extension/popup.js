@@ -1,6 +1,9 @@
 const { DEFAULTS, normalizeSettings } = globalThis.CGH_TOOLKIT;
 const FIELD_IDS = Object.keys(DEFAULTS);
 
+const versionEl = document.getElementById('extensionVersion');
+if (versionEl) versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+
 function getField(id) {
   return document.getElementById(id);
 }

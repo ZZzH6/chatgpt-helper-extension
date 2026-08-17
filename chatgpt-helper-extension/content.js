@@ -11,10 +11,9 @@
   let updateTimer = null;
   let observer = null;
   let storageListenerAdded = false;
-  let formulaButton = null;
-  let formulaMenu = null;
-  let activeFormula = null;
-  let hideFormulaTimer = null;
+  let formulaFeedbackEl = null;
+  let formulaFeedbackTimer = null;
+  let hoveredFormulaNode = null;
   let formulaListenersBound = false;
   let currentMessages = [];
   let highlightedMessageNode = null;
@@ -35,12 +34,7 @@
   let draftInput = null;
   let draftSaveTimer = null;
   let draftObserver = null;
-  let generationWasActive = false;
-  let generationPollTimer = null;
-  let shortcutGTimer = null;
-  let shortcutGArmed = '';
   const selectedMessageSignatures = new Set();
-  const boundFormulaNodes = new WeakSet();
   const CONVERSATION_READY_QUIET_MS = 500;
   const PRE_JUMP_SCROLL_IDLE_MS = 260;
   const PRE_JUMP_SCROLL_IDLE_TIMEOUT_MS = 2200;
@@ -61,10 +55,24 @@
 
   const FORMULA_SELECTORS = [
     '.katex',
+    '.katex-display',
     'mjx-container',
     'math',
     '[data-tex]',
     '[data-latex]',
+    '[data-math]',
+    '[data-mathml]',
+    '[data-math-mode]',
+    '[data-formula]',
+    '[data-testid*="math"]',
+    '[role="math"]',
+    '[aria-roledescription="math"]',
+    '.math',
+    '.math-inline',
+    '.math-display',
+    '.math-block',
+    '.math-container',
+    '.MathJax_Display',
     '.MathJax'
   ].join(',');
 
@@ -79,8 +87,6 @@
     observeDom();
     attachStorageListener();
     startDraftSave();
-    attachTimelineShortcuts();
-    startGenerationMonitor();
     scheduleRefresh();
     setInterval(scheduleRefresh, 5000);
   }
@@ -153,8 +159,8 @@
 
   function isRelevantNode(node) {
     if (!(node instanceof Element)) return false;
-    if (node.id === 'cgh-panel' || node.id === 'cgh-toast' || node.id === 'cgh-formula-btn' || node.id === 'cgh-formula-menu') return false;
-    if (node.closest && (node.closest('#cgh-panel') || node.closest('#cgh-toast') || node.closest('#cgh-formula-btn') || node.closest('#cgh-formula-menu'))) return false;
+    if (node.id === 'cgh-panel' || node.id === 'cgh-toast' || node.id === 'cgh-formula-copy-feedback') return false;
+    if (node.closest && (node.closest('#cgh-panel') || node.closest('#cgh-toast') || node.closest('#cgh-formula-copy-feedback'))) return false;
     return !!(
       node.matches?.(MESSAGE_SELECTORS.join(',')) ||
       node.querySelector?.(MESSAGE_SELECTORS.join(',')) ||
@@ -172,7 +178,6 @@
     syncConversationState();
     ensurePanelAlive();
     ensureFormulaUi();
-    bindFormulaListeners();
     const messages = collectMessages();
     currentMessages = messages;
     syncSelectedMessagesWithCurrent();
@@ -271,42 +276,23 @@
   }
 
   function ensureFormulaUi() {
-    if (!formulaButton) {
-      formulaButton = document.createElement('button');
-      formulaButton.id = 'cgh-formula-btn';
-      formulaButton.type = 'button';
-      formulaButton.textContent = '复制';
-      formulaButton.hidden = true;
-      formulaButton.addEventListener('mouseenter', clearHideFormulaTimer);
-      formulaButton.addEventListener('mouseleave', scheduleHideFormulaUi);
-      formulaButton.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (!activeFormula) return;
-        openFormulaMenu(activeFormula.node, activeFormula.latex, activeFormula.displayMode);
-      });
+    if (!formulaFeedbackEl) {
+      formulaFeedbackEl = document.createElement('div');
+      formulaFeedbackEl.id = 'cgh-formula-copy-feedback';
+      formulaFeedbackEl.setAttribute('role', 'status');
+      formulaFeedbackEl.setAttribute('aria-live', 'polite');
+      formulaFeedbackEl.textContent = '✓ 公式已复制';
+      formulaFeedbackEl.hidden = true;
     }
-    if (!document.body.contains(formulaButton)) {
-      document.body.appendChild(formulaButton);
-    }
-
-    if (!formulaMenu) {
-      formulaMenu = document.createElement('div');
-      formulaMenu.id = 'cgh-formula-menu';
-      formulaMenu.className = 'cgh-formula-menu';
-      formulaMenu.hidden = true;
-      formulaMenu.addEventListener('mouseenter', clearHideFormulaTimer);
-      formulaMenu.addEventListener('mouseleave', scheduleHideFormulaUi);
-    }
-    if (!document.body.contains(formulaMenu)) {
-      document.body.appendChild(formulaMenu);
+    if (!document.body.contains(formulaFeedbackEl)) {
+      document.body.appendChild(formulaFeedbackEl);
     }
 
     if (!formulaListenersBound) {
-      document.addEventListener('pointerdown', handleDocumentPointerDown, true);
-      window.addEventListener('scroll', hideFormulaUi, true);
-      window.addEventListener('resize', hideFormulaUi);
-      document.addEventListener('keydown', handleDocumentKeydown, true);
+      document.addEventListener('pointerover', handleFormulaPointerOver, true);
+      document.addEventListener('pointerout', handleFormulaPointerOut, true);
+      document.addEventListener('click', handleFormulaDocumentClick, true);
+      window.addEventListener('blur', clearFormulaHover);
       formulaListenersBound = true;
     }
   }
@@ -355,7 +341,7 @@
   function extractTextWithLatex(root) {
     const clone = root.cloneNode(true);
 
-    clone.querySelectorAll('#cgh-panel, #cgh-toast, .cgh-formula-btn, .cgh-formula-menu').forEach(el => el.remove());
+    clone.querySelectorAll('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback').forEach(el => el.remove());
 
     clone.querySelectorAll(FORMULA_SELECTORS).forEach((formulaNode) => {
       const latex = extractLatexFromNode(formulaNode);
@@ -472,7 +458,7 @@ ${text}\n\
 
     const target = event.target;
     if (!(target instanceof Element)) return;
-    if (target.closest('#cgh-panel') || target.closest('#cgh-toast') || target.closest('#cgh-formula-btn') || target.closest('#cgh-formula-menu')) {
+    if (target.closest('#cgh-panel') || target.closest('#cgh-toast') || target.closest('#cgh-formula-copy-feedback')) {
       return;
     }
 
@@ -1467,7 +1453,7 @@ ${text}\n\
     if (!(root instanceof Element)) return [];
     return [...root.querySelectorAll('img')].filter((img) => {
       if (!(img instanceof HTMLImageElement)) return false;
-      if (img.closest('#cgh-panel, #cgh-toast, #cgh-formula-btn, #cgh-formula-menu')) return false;
+      if (img.closest('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback')) return false;
       const src = img.currentSrc || img.src || '';
       if (!src || src.startsWith('data:image/svg+xml')) return false;
       if (/avatar|user|profile/i.test(`${img.alt || ''} ${img.className || ''}`) && !img.closest('[data-message-author-role="user"]')) return false;
@@ -1489,8 +1475,7 @@ ${text}\n\
     clone.querySelectorAll([
       '#cgh-panel',
       '#cgh-toast',
-      '#cgh-formula-btn',
-      '#cgh-formula-menu',
+      '#cgh-formula-copy-feedback',
       '.cgh-export-selection-badge',
       'button',
       '[role="button"]',
@@ -1536,6 +1521,7 @@ ${text}\n\
       }
       node.removeAttribute('contenteditable');
       node.removeAttribute('tabindex');
+      node.classList.remove('cgh-formula-target', 'cgh-formula-hovered', 'cgh-formula-block', 'cgh-formula-copied');
     }
   }
 
@@ -3010,109 +2996,66 @@ ${text}\n\
     insertIntoComposer(draft.text, true);
   }
 
-  function startGenerationMonitor() {
-    window.clearInterval(generationPollTimer);
-    generationPollTimer = window.setInterval(() => {
-      const active = isGenerationActive();
-      if (generationWasActive && !active && settings.notificationsEnabled && document.hidden) {
-        void chrome.runtime.sendMessage({
-          type: 'cgh-response-complete',
-          title: document.title.replace(/\s*[-|]\s*ChatGPT\s*$/i, '') || '当前对话',
-        });
-      }
-      generationWasActive = active;
-    }, 800);
-  }
+  function handleFormulaPointerOver(event) {
+    const node = findFormulaNode(event.target);
+    if (!node) return;
 
-  function isGenerationActive() {
-    if (document.querySelector('[data-testid="stop-button"], button[data-testid*="stop"]')) return true;
-    return [...document.querySelectorAll('button')].some(button =>
-      /stop generating|stop streaming|停止生成|停止回答/i.test(button.getAttribute('aria-label') || button.textContent || ''));
-  }
-
-  function attachTimelineShortcuts() {
-    document.addEventListener('keydown', event => {
-      if (!settings.shortcutsEnabled || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
-      const target = event.target;
-      if (target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
-
-      if (event.key === 'g' || (event.key === 'G' && event.shiftKey)) {
-        event.preventDefault();
-        if (shortcutGArmed === event.key) {
-          shortcutGArmed = '';
-          window.clearTimeout(shortcutGTimer);
-          jumpByShortcut(event.key === 'g' ? 0 : currentMessages.length - 1);
-        } else {
-          shortcutGArmed = event.key;
-          window.clearTimeout(shortcutGTimer);
-          shortcutGTimer = window.setTimeout(() => { shortcutGArmed = ''; }, 650);
-        }
-        return;
-      }
-      if (event.key !== 'j' && event.key !== 'k') return;
-      event.preventDefault();
-      const nearest = getNearestMessageIndex();
-      jumpByShortcut(clamp(nearest + (event.key === 'j' ? 1 : -1), 0, currentMessages.length - 1));
-    }, true);
-  }
-
-  function getNearestMessageIndex() {
-    if (activeTimelineIndex >= 0 && activeTimelineIndex < currentMessages.length) return activeTimelineIndex;
-    const center = window.innerHeight / 2;
-    let bestIndex = 0;
-    let bestDistance = Number.POSITIVE_INFINITY;
-    currentMessages.forEach((message, index) => {
-      const rect = message.node.getBoundingClientRect();
-      const distance = Math.abs(rect.top + rect.height / 2 - center);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = index;
-      }
-    });
-    return bestIndex;
-  }
-
-  function jumpByShortcut(index) {
-    if (!currentMessages.length || index < 0) return;
-    activeTimelineIndex = index;
-    queueMessageJump(index);
-    renderTimeline();
-  }
-
-  function bindFormulaListeners() {
-    const formulaNodes = [...document.querySelectorAll(FORMULA_SELECTORS)];
-    for (const node of formulaNodes) {
-      if (!(node instanceof HTMLElement || node instanceof Element)) continue;
-      if (node.closest('#cgh-panel') || node.closest('#cgh-toast')) continue;
-      if (boundFormulaNodes.has(node)) continue;
-
-      boundFormulaNodes.add(node);
-      node.addEventListener('pointerenter', handleFormulaEnter);
-      node.addEventListener('pointerleave', handleFormulaLeave);
-      node.addEventListener('click', handleFormulaClick);
-    }
-  }
-
-  function handleFormulaEnter(event) {
-    const node = event.currentTarget;
-    if (!(node instanceof Element)) return;
-    showFormulaCopyButton(node);
-  }
-
-  function handleFormulaLeave(event) {
     const related = event.relatedTarget;
-    if (related instanceof Element) {
-      if (related.closest('#cgh-formula-btn') || related.closest('#cgh-formula-menu')) return;
-      if (related.closest(FORMULA_SELECTORS)) return;
-    }
-    scheduleHideFormulaUi();
+    if (node === hoveredFormulaNode && related instanceof Node && node.contains(related)) return;
+    setFormulaHover(node);
   }
 
-  async function handleFormulaClick(event) {
+  function handleFormulaPointerOut(event) {
+    const node = findFormulaNode(event.target) || hoveredFormulaNode;
+    if (!node) return;
+
+    const related = event.relatedTarget;
+    if (related instanceof Node && node.contains(related)) return;
+    const nextFormula = findFormulaNode(related);
+    if (nextFormula) {
+      setFormulaHover(nextFormula);
+      return;
+    }
+    clearFormulaHover();
+  }
+
+  function handleFormulaDocumentClick(event) {
+    const node = findFormulaNode(event.target);
+    if (!node) return;
+    void handleFormulaClick(event, node);
+  }
+
+  function findFormulaNode(target) {
+    if (!(target instanceof Element)) return null;
+
+    const candidates = [];
+    let current = target;
+    while (current instanceof Element) {
+      if (current.matches(FORMULA_SELECTORS) &&
+          !current.closest('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback')) {
+        candidates.push(current);
+      }
+      current = current.parentElement;
+    }
+
+    // Prefer the first formula wrapper that contains usable source and has a
+    // visible box. MathML assistive nodes are often hidden inside KaTeX or
+    // MathJax, so selecting them first would make the button disappear.
+    let fallback = null;
+    const visibleCandidates = [];
+    for (const candidate of candidates) {
+      if (!extractLatexFromNode(candidate)) continue;
+      if (!fallback) fallback = candidate;
+      const rect = candidate.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) visibleCandidates.push(candidate);
+    }
+    return visibleCandidates.find(isDisplayFormula) || visibleCandidates[0] || fallback;
+  }
+
+  async function handleFormulaClick(event, node = event.currentTarget) {
     if (event.button !== 0) return;
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 
-    const node = event.currentTarget;
     if (!(node instanceof Element)) return;
 
     event.preventDefault();
@@ -3121,166 +3064,72 @@ ${text}\n\
     const latex = extractLatexFromNode(node);
     if (!latex) return;
 
-    hideFormulaUi();
-    await copyFormulaText(latex, isDisplayFormula(node), settings.copyMode, node);
+    setFormulaHover(node);
+    try {
+      await copyFormulaText(latex, isDisplayFormula(node), settings.copyMode, node);
+      showFormulaCopyFeedback(event.clientX, event.clientY, node);
+      node.classList.remove('cgh-formula-copied');
+      void node.getBoundingClientRect();
+      node.classList.add('cgh-formula-copied');
+      window.setTimeout(() => node.classList.remove('cgh-formula-copied'), 520);
+    } catch (error) {
+      console.error('[CGH] Failed to copy formula', error);
+      showToast('公式复制失败', 2200);
+    }
   }
 
   function isDisplayFormula(node) {
-    if (node.matches('mjx-container[display="true"], .katex-display')) return true;
+    if (node.matches('mjx-container[display="true"], .katex-display, .math-display, .math-block, .MathJax_Display')) return true;
     const displayAttr = node.getAttribute?.('display');
-    if (displayAttr === 'block' || displayAttr === 'true') return true;
-    return false;
+    if (displayAttr === 'block' || displayAttr === 'true' || node.getAttribute?.('data-display') === 'block') return true;
+    return node.tagName === 'DIV' && !node.closest('p');
   }
 
-  function showFormulaCopyButton(node) {
-    const latex = extractLatexFromNode(node);
-    if (!latex) {
-      hideFormulaUi();
-      return;
+  function setFormulaHover(node) {
+    if (!(node instanceof Element)) return;
+    if (hoveredFormulaNode && hoveredFormulaNode !== node) {
+      hoveredFormulaNode.classList.remove('cgh-formula-hovered');
     }
+    hoveredFormulaNode = node;
+    node.classList.add('cgh-formula-target', 'cgh-formula-hovered');
+    node.classList.toggle('cgh-formula-block', isDisplayFormula(node));
+  }
 
-    const rect = node.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
+  function clearFormulaHover() {
+    hoveredFormulaNode?.classList.remove('cgh-formula-hovered');
+    hoveredFormulaNode = null;
+  }
 
+  function showFormulaCopyFeedback(clientX, clientY, formulaNode) {
     ensureFormulaUi();
-    clearHideFormulaTimer();
-    closeFormulaMenu();
-    activeFormula = {
-      node,
-      latex,
-      displayMode: isDisplayFormula(node),
-    };
+    const feedback = formulaFeedbackEl;
+    const formulaRect = formulaNode.getBoundingClientRect();
+    const pointerX = Number.isFinite(clientX) ? clientX : formulaRect.left + formulaRect.width / 2;
+    const pointerY = Number.isFinite(clientY) ? clientY : formulaRect.top + formulaRect.height / 2;
 
-    const buttonWidth = 52;
-    const buttonHeight = 24;
-    const left = clamp(rect.right - buttonWidth, 8, Math.max(8, window.innerWidth - buttonWidth - 8));
-    const above = rect.top - buttonHeight - 6;
-    const below = rect.bottom + 6;
-    const top = above >= 8 ? above : below;
-    const maxTop = Math.max(8, window.innerHeight - buttonHeight - 8);
+    window.clearTimeout(formulaFeedbackTimer);
+    feedback.hidden = false;
+    feedback.classList.remove('cgh-visible');
+    feedback.style.visibility = 'hidden';
+    feedback.style.left = '0px';
+    feedback.style.top = '0px';
+    const rect = feedback.getBoundingClientRect();
+    const gap = 14;
+    const left = clamp(pointerX + gap, 8, Math.max(8, window.innerWidth - rect.width - 8));
+    const preferredTop = pointerY + gap;
+    const top = preferredTop + rect.height <= window.innerHeight - 8
+      ? preferredTop
+      : pointerY - rect.height - gap;
 
-    formulaButton.hidden = false;
-    formulaButton.style.display = 'block';
-    formulaButton.style.left = `${left}px`;
-    formulaButton.style.top = `${clamp(top, 8, maxTop)}px`;
-  }
-
-  function hideFormulaUi() {
-    clearHideFormulaTimer();
-    closeFormulaMenu();
-    if (formulaButton) {
-      formulaButton.hidden = true;
-      formulaButton.style.display = 'none';
-    }
-    activeFormula = null;
-  }
-
-  function scheduleHideFormulaUi() {
-    clearHideFormulaTimer();
-    hideFormulaTimer = window.setTimeout(hideFormulaUi, 180);
-  }
-
-  function clearHideFormulaTimer() {
-    if (hideFormulaTimer) {
-      window.clearTimeout(hideFormulaTimer);
-      hideFormulaTimer = null;
-    }
-  }
-
-  function openFormulaMenu(anchor, latex, displayMode) {
-    ensureFormulaUi();
-    clearHideFormulaTimer();
-    closeFormulaMenu();
-
-    const menu = formulaMenu;
-    menu.innerHTML = '';
-
-    const modeLabels = { latex: 'LaTeX', markdown: 'Markdown', word: 'MathML / Word' };
-    const defaultCopyMode = normalizeCopyMode(settings.copyMode);
-    const quickBtn = document.createElement('button');
-    quickBtn.textContent = `按默认格式复制（${modeLabels[defaultCopyMode]}）`;
-    quickBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, defaultCopyMode, anchor);
-      hideFormulaUi();
-    });
-
-    const latexBtn = document.createElement('button');
-    latexBtn.textContent = '复制 LaTeX';
-    latexBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, 'latex', anchor);
-      hideFormulaUi();
-    });
-
-    const markdownBtn = document.createElement('button');
-    markdownBtn.textContent = '复制 Markdown';
-    markdownBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, 'markdown', anchor);
-      hideFormulaUi();
-    });
-
-    const wordBtn = document.createElement('button');
-    wordBtn.textContent = '复制 MathML / Word';
-    wordBtn.addEventListener('click', async () => {
-      await copyFormulaText(latex, displayMode, 'word', anchor);
-      hideFormulaUi();
-    });
-
-    menu.append(quickBtn, latexBtn, markdownBtn, wordBtn);
-    menu.hidden = false;
-    menu.style.display = 'block';
-    menu.style.visibility = 'hidden';
-
-    const rect = anchor.getBoundingClientRect();
-    const menuBox = menu.getBoundingClientRect();
-    const menuWidth = menuBox.width || 180;
-    const menuHeight = menuBox.height || 120;
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const gap = 8;
-
-    let left;
-    if (rect.right + menuWidth + gap <= viewportWidth) {
-      left = rect.right + gap;
-    } else if (rect.left - menuWidth - gap >= 0) {
-      left = rect.left - menuWidth - gap;
-    } else {
-      left = rect.left + rect.width / 2 - menuWidth / 2;
-    }
-
-    let top;
-    if (rect.top - menuHeight - gap >= 0) {
-      top = rect.top - menuHeight - gap;
-    } else if (rect.bottom + menuHeight + gap <= viewportHeight) {
-      top = rect.bottom + gap;
-    } else {
-      top = rect.bottom - menuHeight;
-    }
-
-    menu.style.left = `${clamp(left, 8, Math.max(8, viewportWidth - menuWidth - 8))}px`;
-    menu.style.top = `${clamp(top, 8, Math.max(8, viewportHeight - menuHeight - 8))}px`;
-    menu.style.visibility = 'visible';
-  }
-
-  function closeFormulaMenu() {
-    if (!formulaMenu) return;
-    formulaMenu.hidden = true;
-    formulaMenu.style.display = 'none';
-    formulaMenu.innerHTML = '';
-  }
-
-  function handleDocumentPointerDown(event) {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    if (target.closest('#cgh-formula-btn') || target.closest('#cgh-formula-menu') || target.closest('#cgh-panel') || target.closest('#cgh-toast')) {
-      return;
-    }
-    hideFormulaUi();
-  }
-
-  function handleDocumentKeydown(event) {
-    if (event.key === 'Escape') {
-      hideFormulaUi();
-    }
+    feedback.style.left = `${left}px`;
+    feedback.style.top = `${clamp(top, 8, Math.max(8, window.innerHeight - rect.height - 8))}px`;
+    feedback.style.visibility = 'visible';
+    void feedback.offsetWidth;
+    feedback.classList.add('cgh-visible');
+    formulaFeedbackTimer = window.setTimeout(() => {
+      feedback.classList.remove('cgh-visible');
+      feedback.hidden = true;
+    }, 1250);
   }
 
   function clamp(value, min, max) {
@@ -3291,22 +3140,17 @@ ${text}\n\
 
   async function copyFormulaText(latex, displayMode, mode, sourceNode = null) {
     let text;
-    let label;
     const normalizedMode = normalizeCopyMode(mode);
     if (normalizedMode === 'word') {
       await copyFormulaForWord(sourceNode, latex);
-      showToast('已复制 MathML / Word');
       return;
     }
     if (normalizedMode === 'markdown') {
       text = formatMarkdownFormula(latex, displayMode);
-      label = 'Markdown';
     } else {
       text = normalizeLatexForCopy(latex);
-      label = 'LaTeX';
     }
     await copyText(text);
-    showToast(`已复制 ${label}`);
   }
 
   async function copyFormulaForWord(sourceNode, latex) {
@@ -3331,11 +3175,18 @@ ${text}\n\
 
   function normalizeLatexForCopy(latex) {
     if (!latex) return '';
-    return stripMathDelimiters(latex)
+    return normalizeLatexCommandSpacing(stripMathDelimiters(latex)
       .replace(/\u00A0/g, ' ')
       .replace(/\\tag\s*\{([^{}]*)\}/g, '#($1)')
       .replace(/\s+/g, ' ')
-      .trim();
+      .trim());
+  }
+
+  function normalizeLatexCommandSpacing(latex) {
+    return String(latex || '').replace(
+      /(\\(?:Rightarrow|Leftarrow|Leftrightarrow|Longrightarrow|Longleftarrow|to|mapsto|implies))(?=[A-Za-z])/g,
+      '$1 ',
+    );
   }
 
   function formatMarkdownFormula(latex, displayMode) {
@@ -3394,65 +3245,786 @@ ${text}\n\
   function extractLatexFromNode(node) {
     if (!(node instanceof Element)) return '';
 
-    const directCandidates = [
-      node.getAttribute('data-tex'),
-      node.getAttribute('data-latex'),
-      node.getAttribute('latex'),
-      node.getAttribute('aria-label'),
-      node.getAttribute('alttext'),
-    ].filter(Boolean);
+    // Match Voyager's source-first behavior. The visible .katex/.katex-display
+    // node is frequently nested inside the element that owns data-math, so
+    // checking only attributes on `node` silently falls through to lossy DOM
+    // reverse conversion (which drops \boxed, scripts, etc.). Search the
+    // closest source-bearing ancestor first, then the current node/subtree.
+    const sourceSelector = [
+      '[data-math]',
+      '[data-tex]',
+      '[data-latex]',
+      '[latex]',
+      '[data-math-source]',
+      '[data-tex-source]',
+    ].join(',');
+    const sourceNodes = [];
+    const closestSource = node.closest(sourceSelector);
+    if (closestSource) sourceNodes.push(closestSource);
+    if (node.matches(sourceSelector) && !sourceNodes.includes(node)) sourceNodes.push(node);
+    const nestedSource = node.querySelector(sourceSelector);
+    if (nestedSource && !sourceNodes.includes(nestedSource)) sourceNodes.push(nestedSource);
 
-    for (const candidate of directCandidates) {
-      const cleaned = cleanLatexCandidate(candidate);
-      if (looksLikeLatex(cleaned)) return cleaned;
+    for (const sourceNode of sourceNodes) {
+      const explicitCandidates = [
+        sourceNode.getAttribute('data-math'),
+        sourceNode.getAttribute('data-tex'),
+        sourceNode.getAttribute('data-latex'),
+        sourceNode.getAttribute('latex'),
+        sourceNode.getAttribute('data-math-source'),
+        sourceNode.getAttribute('data-tex-source'),
+      ].filter(Boolean);
+
+      for (const candidate of explicitCandidates) {
+        const cleaned = cleanLatexCandidate(candidate);
+        // On a rendered formula, an attribute can still be an accessibility or
+        // display-text label. Only accept it as source when it has LaTeX syntax.
+        // This keeps a plain value such as "dydf(x0,y)..." out of the clipboard.
+        if (cleaned && (looksLikeLatexSource(cleaned) || !hasFormulaRenderingEvidence(sourceNode))) return cleaned;
+      }
     }
 
-    const annotation = node.querySelector('annotation[encoding="application/x-tex"], annotation[encoding="TeX"]');
+    const annotation = node.querySelector([
+      'annotation[encoding="application/x-tex" i]',
+      'annotation[encoding="tex" i]',
+      'annotation[encoding="application/x-latex" i]',
+    ].join(','));
     if (annotation?.textContent) {
       const cleaned = cleanLatexCandidate(annotation.textContent);
+      if (cleaned) return cleaned;
+    }
+
+    const texScript = node.querySelector('script[type^="math/tex" i]');
+    if (texScript?.textContent) {
+      const cleaned = cleanLatexCandidate(texScript.textContent);
+      if (cleaned) return cleaned;
+    }
+
+    const adjacentTexScript = [node.previousElementSibling, node.nextElementSibling]
+      .find(element => element?.matches?.('script[type^="math/tex" i]'));
+    if (adjacentTexScript?.textContent) {
+      const cleaned = cleanLatexCandidate(adjacentTexScript.textContent);
       if (cleaned) return cleaned;
     }
 
     const semantics = node.querySelector('semantics > annotation');
     if (semantics?.textContent) {
       const cleaned = cleanLatexCandidate(semantics.textContent);
-      if (looksLikeLatex(cleaned)) return cleaned;
+      if (cleaned) return cleaned;
     }
 
-    const mjxAssistive = node.querySelector('mjx-assistive-mml math');
-    if (mjxAssistive) {
-      const alttext = mjxAssistive.getAttribute('alttext');
-      if (alttext) {
-        const cleaned = cleanLatexCandidate(alttext);
-        if (cleaned) return cleaned;
+    const hasRenderedFormula = hasFormulaRenderingEvidence(node);
+    const hasKatexRendering = node.matches('.katex, .katex-display') || !!node.querySelector('.katex, .katex-html');
+
+    // When both KaTeX HTML and assistive MathML are present, the visible
+    // KaTeX tree preserves presentation details such as \boxed and scripts
+    // more faithfully. Use it before trying to reverse-convert MathML.
+    if (hasKatexRendering) {
+      const convertedKatex = katexHtmlToLatex(node);
+      if (looksLikeLatexSource(convertedKatex)) return convertedKatex;
+    }
+
+    const mathml = node.matches('math') ? node : node.querySelector('mjx-assistive-mml math, .katex-mathml math, math');
+    if (mathml) {
+      const mathmlSourceCandidates = [
+        mathml.getAttribute('data-tex'),
+        mathml.getAttribute('data-latex'),
+        mathml.getAttribute('alttext'),
+      ].filter(Boolean);
+      for (const candidate of mathmlSourceCandidates) {
+        const cleaned = cleanLatexCandidate(candidate);
+        if (looksLikeLatexSource(cleaned)) return cleaned;
       }
     }
 
-    if (node.matches('.katex')) {
-      const ann = node.querySelector('annotation');
-      if (ann?.textContent) {
-        const cleaned = cleanLatexCandidate(ann.textContent);
-        if (cleaned) return cleaned;
-      }
-      const mathml = node.querySelector('math');
-      if (mathml?.getAttribute('alttext')) {
-        const cleaned = cleanLatexCandidate(mathml.getAttribute('alttext'));
-        if (cleaned) return cleaned;
-      }
+    const convertedMathml = mathMlToLatex(mathml);
+    if (looksLikeLatexSource(convertedMathml)) return convertedMathml;
+
+    if (hasRenderedFormula && !hasKatexRendering) {
+      const convertedKatex = katexHtmlToLatex(node);
+      if (looksLikeLatexSource(convertedKatex)) return convertedKatex;
     }
 
-    if (node.matches('math')) {
-      const alttext = node.getAttribute('alttext');
-      if (alttext) {
-        const cleaned = cleanLatexCandidate(alttext);
-        if (cleaned) return cleaned;
-      }
+    // Never reverse-engineer a rendered formula from textContent. It loses
+    // fractions, scripts and delimiters (for example: "dydf(x0,y)...").
+    // Plain text fallback is only safe for a non-rendered, explicitly marked
+    // formula-like node.
+    if (!hasRenderedFormula) {
+      const text = normalizeWhitespace(node.textContent || '');
+      if (looksLikeLatex(text)) return text;
     }
-
-    const text = normalizeWhitespace(node.textContent || '');
-    if (looksLikeLatex(text)) return text;
 
     return '';
+  }
+
+  function looksLikeLatexSource(text) {
+    const value = String(text || '').trim();
+    if (!value || isGenericFormulaLabel(value)) return false;
+    return /\\[A-Za-z]+|[_^{}]/.test(value);
+  }
+
+  function hasFormulaRenderingEvidence(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.matches([
+      '.katex',
+      '.katex-display',
+      'mjx-container',
+      'math',
+      '.MathJax',
+      '.MathJax_Display',
+      '[role="math"]',
+      '.math',
+      '.math-inline',
+      '.math-display',
+      '.math-block',
+      '.math-container',
+      '[data-tex]',
+      '[data-latex]',
+      '[data-math]',
+      '[data-mathml]',
+      '[data-math-mode]',
+      '[data-formula]',
+      '[data-testid*="math"]',
+      '[aria-roledescription="math"]',
+    ].join(','))) return true;
+    return !!node.querySelector('math, mjx-container, .katex, annotation, script[type^="math/tex" i]');
+  }
+
+  function isGenericFormulaLabel(text) {
+    return /^(?:math|formula|equation|inline|block|display|true|false|数学|公式|数学公式)$/i.test(String(text || '').trim());
+  }
+
+  function mathMlToLatex(math) {
+    if (!(math instanceof Element) || math.localName !== 'math') return '';
+
+    const convert = (node) => {
+      if (!node) return '';
+      if (node.nodeType === Node.TEXT_NODE) {
+        const value = node.textContent || '';
+        return node.parentElement?.localName === 'mtext' ? value : value.trim();
+      }
+      if (!(node instanceof Element)) return '';
+
+      const childValues = () => [...node.childNodes].map(convert).join('');
+      const child = (index) => convert(node.children[index]);
+      switch (node.localName) {
+        case 'math':
+        case 'mpadded':
+        case 'mstyle':
+        case 'mphantom':
+        case 'merror':
+          return childValues();
+        case 'menclose': {
+          const notation = (node.getAttribute('notation') || '').split(/\s+/).filter(Boolean);
+          const body = childValues();
+          return notation.includes('box') || notation.includes('roundedbox')
+            ? `\\boxed{${body}}`
+            : body;
+        }
+        case 'mrow': {
+          const values = childValues();
+          const children = [...node.children];
+          const first = children[0];
+          const last = children[children.length - 1];
+          const open = first?.localName === 'mo' && getMathMoRole(first) === 'open';
+          const close = last?.localName === 'mo' && getMathMoRole(last) === 'close';
+          return close && !open ? `\\left.${values}` : values;
+        }
+        case 'semantics':
+          return node.children.length ? child(0) : '';
+        case 'annotation':
+        case 'annotation-xml':
+          return '';
+        case 'mi':
+          return convertMathIdentifier(childValues());
+        case 'mn':
+          return childValues().trim();
+        case 'mo': {
+          const operator = convertMathOperator(childValues()).trim();
+          const role = getMathMoRole(node);
+          const delimiter = convertMathDelimiter(operator);
+          if (role === 'open') return delimiter ? `\\left${delimiter}` : '\\left.';
+          if (role === 'close') return delimiter ? `\\right${delimiter}` : '\\right.';
+          return delimiter || operator;
+        }
+        case 'mtext':
+          return `\\text{${childValues().replace(/[{}]/g, '\\$&').trim()}}`;
+        case 'mfrac':
+          return `\\frac{${child(0)}}{${child(1)}}`;
+        case 'msqrt':
+          return `\\sqrt{${childValues()}}`;
+        case 'mroot':
+          return `\\sqrt[${child(1)}]{${child(0)}}`;
+        case 'msup':
+          return `${formatMathScriptBase(child(0))}^${needsMathScriptBraces(child(1)) ? `{${child(1)}}` : child(1)}`;
+        case 'msub':
+          return `${formatMathScriptBase(child(0))}_${needsMathScriptBraces(child(1)) ? `{${child(1)}}` : child(1)}`;
+        case 'msubsup':
+          return `${formatMathScriptBase(child(0))}_${needsMathScriptBraces(child(1)) ? `{${child(1)}}` : child(1)}^${needsMathScriptBraces(child(2)) ? `{${child(2)}}` : child(2)}`;
+        case 'mover':
+          return `\\overset{${child(1)}}{${child(0)}}`;
+        case 'munder':
+          return `\\underset{${child(1)}}{${child(0)}}`;
+        case 'munderover':
+          return `\\overset{${child(2)}}{\\underset{${child(1)}}{${child(0)}}}`;
+        case 'mfenced': {
+          const open = convertMathDelimiter(node.getAttribute('open') ?? '(');
+          const close = convertMathDelimiter(node.getAttribute('close') ?? ')');
+          return `${open}${childValues()}${close}`;
+        }
+        case 'mtable':
+          return `\\begin{matrix}${[...node.children].map(convert).join('\\\\')}\\end{matrix}`;
+        case 'mtr':
+          return [...node.children].map(convert).join('&');
+        case 'mtd':
+          return childValues();
+        case 'mspace':
+          return '';
+        default:
+          return childValues();
+      }
+    };
+
+    return convert(math).replace(/\s+/g, ' ').trim();
+  }
+
+  function getMathMoRole(node) {
+    const fence = node.getAttribute('fence') === 'true';
+    const texClass = node.getAttribute('data-mjx-texclass');
+    if (texClass === 'OPEN' || (fence && node.getAttribute('form') === 'prefix')) return 'open';
+    if (texClass === 'CLOSE' || (fence && node.getAttribute('form') === 'postfix')) return 'close';
+    if (!fence) return '';
+
+    const siblings = [...(node.parentElement?.children || [])];
+    if (siblings[0] === node) return 'open';
+    if (siblings[siblings.length - 1] === node) return 'close';
+    return '';
+  }
+
+  function convertMathIdentifier(value) {
+    const text = value.trim();
+    const identifiers = {
+      'α': '\\alpha', 'β': '\\beta', 'γ': '\\gamma', 'δ': '\\delta',
+      'ε': '\\epsilon', 'ζ': '\\zeta', 'η': '\\eta', 'θ': '\\theta',
+      'ι': '\\iota', 'κ': '\\kappa', 'λ': '\\lambda', 'μ': '\\mu',
+      'ν': '\\nu', 'ξ': '\\xi', 'π': '\\pi', 'ρ': '\\rho',
+      'σ': '\\sigma', 'τ': '\\tau', 'υ': '\\upsilon', 'φ': '\\phi',
+      'χ': '\\chi', 'ψ': '\\psi', 'ω': '\\omega',
+      'Γ': '\\Gamma', 'Δ': '\\Delta', 'Θ': '\\Theta', 'Λ': '\\Lambda',
+      'Ξ': '\\Xi', 'Π': '\\Pi', 'Σ': '\\Sigma', 'Φ': '\\Phi',
+      'Ψ': '\\Psi', 'Ω': '\\Omega',
+    };
+    return identifiers[text] || text;
+  }
+
+  function convertMathOperator(value) {
+    const text = value.trim();
+    const operators = {
+      '−': '-', '×': '\\times ', '÷': '\\div ', '·': '\\cdot ',
+      '≤': '\\leq ', '≥': '\\geq ', '≠': '\\neq ', '≈': '\\approx ',
+      '∑': '\\sum ', '∏': '\\prod ', '∫': '\\int ', '∞': '\\infty ',
+      '→': '\\to ', '⇒': '\\Rightarrow ', '∈': '\\in ', '∉': '\\notin ',
+      '∣': '|', '‖': '\\Vert ', '′': '\\prime ',
+    };
+    return operators[text] || text;
+  }
+
+  function convertMathDelimiter(value) {
+    const text = value.trim();
+    const delimiters = {
+      '{': '\\{', '}': '\\}', '∣': '|', '‖': '\\Vert',
+      '⟨': '\\langle', '⟩': '\\rangle', '⌊': '\\lfloor', '⌋': '\\rfloor',
+      '⌈': '\\lceil', '⌉': '\\rceil', '\\': '\\backslash',
+    };
+    return delimiters[text] || text;
+  }
+
+  function needsMathScriptBraces(value) {
+    const text = String(value || '').trim();
+    if (/^[A-Za-z0-9]$/.test(text)) return false;
+    if (/^\\[a-zA-Z]+$/.test(text)) return false;
+    if (/^\\[a-zA-Z]+\{[^{}]*\}$/.test(text)) return false;
+    return true;
+  }
+
+  function formatMathScriptBase(value) {
+    const text = String(value || '').trim();
+    if (!text) return '{}';
+    if (/^[A-Za-z0-9]$/.test(text)) return text;
+    if (/^\\[a-zA-Z]+$/.test(text)) return text;
+    if (text.startsWith('\\left') && text.includes('\\right')) return text;
+    if (/^\\[a-zA-Z]+[_^]\{/.test(text)) return text;
+    return `{${text}}`;
+  }
+
+  function katexHtmlToLatex(root) {
+    if (!(root instanceof Element)) return '';
+    const html = root.matches('.katex-html') ? root : root.querySelector('.katex-html');
+    if (!html) return '';
+
+    const bases = [...html.children].filter(node => node.classList.contains('base'));
+    const pieces = bases.map(base => convertKatexChildren(base)).filter(piece => piece.text);
+    return joinKatexPieces(pieces).replace(/[ \t]+\n/g, '\n').replace(/\s+/g, ' ').trim();
+  }
+
+  function sanitizeKatexText(text) {
+    return String(text || '').replace(/\u200B/g, '').replace(/\u00A0/g, ' ').trim();
+  }
+
+  function getKatexClasses(node) {
+    return node.classList ? [...node.classList] : [];
+  }
+
+  function hasKatexClass(node, name) {
+    return node?.classList?.contains(name) === true;
+  }
+
+  function hasKatexClassPrefix(node, prefix) {
+    return getKatexClasses(node).some(name => name.startsWith(prefix));
+  }
+
+  function isKatexElement(node) {
+    return node instanceof Element;
+  }
+
+  function isKatexIgnored(node) {
+    if (!isKatexElement(node)) return false;
+    if (['svg', 'path'].includes(node.tagName.toLowerCase())) return true;
+    return getKatexClasses(node).some(name =>
+      ['strut', 'pstrut', 'mspace', 'vlist-s', 'hide-tail', 'frac-line', 'svg-align'].includes(name));
+  }
+
+  function isKatexScript(node) {
+    return hasKatexClass(node, 'msupsub');
+  }
+
+  function isKatexTransparent(node) {
+    return getKatexClasses(node).some(name =>
+      ['sizing', 'vlist-t', 'vlist-r', 'vlist', 'delimsizing'].includes(name));
+  }
+
+  function mapKatexText(text, classes) {
+    const value = sanitizeKatexText(text);
+    if (!value) return '';
+
+    const greek = {
+      'α': '\\alpha', 'β': '\\beta', 'γ': '\\gamma', 'δ': '\\delta', 'ε': '\\epsilon',
+      'ζ': '\\zeta', 'η': '\\eta', 'θ': '\\theta', 'ι': '\\iota', 'κ': '\\kappa',
+      'λ': '\\lambda', 'μ': '\\mu', 'ν': '\\nu', 'ξ': '\\xi', 'π': '\\pi',
+      'ρ': '\\rho', 'σ': '\\sigma', 'τ': '\\tau', 'υ': '\\upsilon', 'φ': '\\phi',
+      'χ': '\\chi', 'ψ': '\\psi', 'ω': '\\omega', 'Γ': '\\Gamma', 'Δ': '\\Delta',
+      'Θ': '\\Theta', 'Λ': '\\Lambda', 'Ξ': '\\Xi', 'Π': '\\Pi', 'Σ': '\\Sigma',
+      'Φ': '\\Phi', 'Ψ': '\\Psi', 'Ω': '\\Omega',
+    };
+    const operators = {
+      '−': '-', '×': '\\times', '÷': '\\div', '·': '\\cdot', '∗': '*',
+      '∘': '\\circ', '±': '\\pm', '∓': '\\mp', '≤': '\\leq', '≥': '\\geq',
+      '≠': '\\neq', '≈': '\\approx', '∑': '\\sum', '∏': '\\prod', '∫': '\\int',
+      '∞': '\\infty', '→': '\\to', '⇒': '\\Rightarrow', '∈': '\\in', '∉': '\\notin',
+      '∣': '|', '‖': '\\Vert', '′': '\\prime', '∇': '\\nabla', '∂': '\\partial',
+    };
+    const fontCommands = {
+      mathrm: 'mathrm', mathit: 'mathit', mathbf: 'mathbf', mathsf: 'mathsf', mathtt: 'mathtt',
+      mathcal: 'mathcal', mathscr: 'mathscr', mathfrak: 'mathfrak', mathbb: 'mathbb', boldsymbol: 'boldsymbol',
+    };
+
+    let mapped = '';
+    for (const char of value) {
+      if (greek[char]) mapped += greek[char];
+      else if (operators[char]) mapped += operators[char];
+      else mapped += char;
+    }
+
+    const fontClass = classes.find(name => fontCommands[name]);
+    if (fontClass && !classes.includes('op-symbol')) {
+      return `\\${fontCommands[fontClass]}{${mapped}}`;
+    }
+    return mapped;
+  }
+
+  function isKatexLeftRightGroup(text) {
+    return typeof text === 'string' && text.startsWith('\\left') && text.includes('\\right');
+  }
+
+  function katexAtomNeedsGroup(node, text) {
+    if (!text) return true;
+    if (isKatexLeftRightGroup(text)) return false;
+    if (hasKatexClass(node, 'mop') && text.startsWith('\\')) return false;
+    if (/^\\[a-zA-Z]+$/.test(text)) return false;
+    if (/^\\[a-zA-Z]+\{[^{}]*\}$/.test(text)) return false;
+    if (/^\\sqrt(?:\[[^\]]*\])?\{[\s\S]*\}$/.test(text)) return false;
+    if (/^\\frac\{[\s\S]*\}\{[\s\S]*\}$/.test(text)) return false;
+    if (/^[A-Za-z0-9]$/.test(text)) return false;
+    if (/^[^\sA-Za-z0-9\\]$/.test(text)) return false;
+    if (/^[A-Za-z0-9][_^]\{/.test(text)) return false;
+    if (/^\\[a-zA-Z]+[_^]\{/.test(text)) return false;
+    return true;
+  }
+
+  function joinKatexPieces(pieces) {
+    let output = '';
+    for (const piece of pieces) {
+      if (output && /\\[a-zA-Z]+$/.test(output) && /^[A-Za-z0-9]/.test(piece.text)) {
+        output += ' ';
+      }
+      output += piece.text;
+    }
+    return output;
+  }
+
+  function convertKatexChildren(parent) {
+    const pieces = [];
+    for (const child of [...parent.childNodes]) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const text = sanitizeKatexText(child.textContent);
+        if (text) {
+          pieces.push({ text: mapKatexText(text, getKatexClasses(parent)), needsGroup: text.length > 1 });
+        }
+        continue;
+      }
+      if (!isKatexElement(child)) continue;
+      if (isKatexIgnored(child)) continue;
+
+      if (isKatexScript(child)) {
+        const scripts = parseKatexScripts(child);
+        const base = pieces.pop() || { text: '', needsGroup: true };
+        const baseText = base.needsGroup && base.text ? `{${base.text}}` : base.text;
+        let text = baseText;
+        if (scripts.sub) text += formatKatexScriptArg('_', scripts.sub);
+        if (scripts.sup) text += formatKatexScriptArg('^', scripts.sup);
+        pieces.push({ text, needsGroup: false });
+        continue;
+      }
+
+      const converted = convertKatexElement(child);
+      if (converted.text) pieces.push(converted);
+    }
+
+    if (!pieces.length) return { text: '', needsGroup: true };
+    if (pieces.length === 1) return pieces[0];
+    return { text: joinKatexPieces(pieces), needsGroup: true };
+  }
+
+  function needsKatexScriptArgBraces(text) {
+    if (!text) return false;
+    if (/^[A-Za-z0-9]$/.test(text)) return false;
+    if (/^\\[a-zA-Z]+$/.test(text)) return false;
+    if (/^\\[a-zA-Z]+\{[^{}]*\}$/.test(text)) return false;
+    return true;
+  }
+
+  function formatKatexScriptArg(kind, text) {
+    return needsKatexScriptArgBraces(text) ? `${kind}{${text}}` : `${kind}${text}`;
+  }
+
+  function getKatexPositionedTop(element, stop) {
+    let current = element;
+    while (current && current !== stop) {
+      const style = current.getAttribute?.('style') || '';
+      const match = style.match(/(?:^|;\s*)top:\s*(-?[\d.]+)em/);
+      if (match) return Number(match[1]);
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function parseKatexScripts(script) {
+    const result = { sub: '', sup: '' };
+    const candidates = [...script.querySelectorAll('.mtight')];
+    const wrappers = candidates.filter(node =>
+      !candidates.some(other => other !== node && other.contains(node)));
+
+    for (const wrapper of wrappers) {
+      const top = getKatexPositionedTop(wrapper, script);
+      const text = convertKatexChildren(wrapper).text;
+      if (!text) continue;
+      if (top !== null && top <= -2.85) result.sup = text;
+      else result.sub = text;
+    }
+    return result;
+  }
+
+  function parseKatexFrac(frac) {
+    let vlist = null;
+    for (const child of frac.children) {
+      if (!hasKatexClass(child, 'vlist-t')) continue;
+      for (const child2 of child.children) {
+        if (!hasKatexClass(child2, 'vlist-r')) continue;
+        for (const child3 of child2.children) {
+          if (hasKatexClass(child3, 'vlist') &&
+              [...child3.children].some(row => /top:/.test(row.getAttribute?.('style') || ''))) {
+            vlist = child3;
+            break;
+          }
+        }
+        if (vlist) break;
+      }
+      if (vlist) break;
+    }
+
+    if (!vlist) return { text: '', needsGroup: true };
+    const rows = [];
+    for (const row of vlist.children) {
+      if (!isKatexElement(row)) continue;
+      const style = row.getAttribute?.('style') || '';
+      const match = style.match(/(?:^|;\s*)top:\s*(-?[\d.]+)em/);
+      if (!match) continue;
+      const converted = convertKatexChildren(row);
+      if (converted.text) rows.push({ top: Number(match[1]), text: converted.text });
+    }
+
+    if (rows.length < 2) return { text: '', needsGroup: true };
+    rows.sort((a, b) => a.top - b.top);
+    return {
+      text: `\\frac{${rows[0].text}}{${rows[rows.length - 1].text}}`,
+      needsGroup: false,
+    };
+  }
+
+  function parseKatexSqrt(element) {
+    const root = element.querySelector('.root');
+    const radicand = element.querySelector('.svg-align > .mord');
+    const body = radicand ? convertKatexChildren(radicand).text : convertKatexChildren(element).text;
+    if (root) {
+      return { text: `\\sqrt[${convertKatexChildren(root).text}]{${body}}`, needsGroup: false };
+    }
+    return { text: `\\sqrt{${body}}`, needsGroup: false };
+  }
+
+  function parseKatexTable(table) {
+    const columns = [...table.children].filter(node => hasKatexClassPrefix(node, 'col-align-'));
+    const columnRows = columns.map((column) => {
+      let vlist = null;
+      for (const child of column.children) {
+        if (!hasKatexClass(child, 'vlist-t')) continue;
+        for (const child2 of child.children) {
+          if (!hasKatexClass(child2, 'vlist-r')) continue;
+          for (const child3 of child2.children) {
+            if (hasKatexClass(child3, 'vlist') &&
+                [...child3.children].some(row => /top:/.test(row.getAttribute?.('style') || ''))) {
+              vlist = child3;
+              break;
+            }
+          }
+          if (vlist) break;
+        }
+        if (vlist) break;
+      }
+
+      const rows = [];
+      if (!vlist) return rows;
+      for (const row of vlist.children) {
+        if (!isKatexElement(row)) continue;
+        if (!/top:/.test(row.getAttribute?.('style') || '')) continue;
+        rows.push(convertKatexChildren(row).text);
+      }
+      return rows;
+    });
+
+    const rowCount = Math.max(0, ...columnRows.map(rows => rows.length));
+    const body = [];
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      body.push(columnRows.map(rows => rows[rowIndex] || '').join(' & '));
+    }
+    return { text: `\\begin{matrix}${body.join(' \\\\ ')}\\end{matrix}`, needsGroup: false };
+  }
+
+  function parseKatexOverline(element, kind) {
+    const base = element.querySelector('.vlist > [style*="top:"] .mord');
+    const body = base ? convertKatexChildren(base).text : '';
+    return { text: `\\${kind}{${body}}`, needsGroup: false };
+  }
+
+  function parseKatexAccent(element) {
+    const base = element.querySelector('.vlist > [style*="top:"] .mord');
+    const body = base ? convertKatexChildren(base).text : '';
+    if (!body) return { text: '', needsGroup: true };
+
+    const accentElement = element.querySelector('.accent-body');
+    const accentText = sanitizeKatexText(accentElement?.textContent);
+    const accents = {
+      '^': 'hat', 'ˉ': 'bar', '¯': 'bar', '~': 'tilde', '˜': 'tilde',
+      '´': 'acute', '`': 'grave', '˙': 'dot', '¨': 'ddot', 'ˇ': 'check', '˘': 'breve',
+    };
+    if (accentText && accents[accentText]) {
+      return { text: `\\${accents[accentText]}{${body}}`, needsGroup: false };
+    }
+    if (accentElement?.querySelector('svg')) {
+      return { text: `\\vec{${body}}`, needsGroup: false };
+    }
+    return { text: body, needsGroup: false };
+  }
+
+  function parseKatexDelimiter(element) {
+    if (hasKatexClass(element, 'nulldelimiter')) return '.';
+    const text = sanitizeKatexText(element.textContent);
+    if (text) return mapKatexDelimiter(text);
+
+    const svg = element.querySelector('svg');
+    const viewBox = svg?.getAttribute?.('viewBox') || '';
+    const width = Number.parseFloat(viewBox.split(/\s+/)[2] || '0');
+    if (width === 333) return '|';
+    if (width === 556) return '\\Vert';
+    return '';
+  }
+
+  function mapKatexDelimiter(text) {
+    const delimiters = {
+      '{': '\\{', '}': '\\}', '∣': '|', '‖': '\\Vert',
+      '⟨': '\\langle', '⟩': '\\rangle', '⌊': '\\lfloor', '⌋': '\\rfloor',
+      '⌈': '\\lceil', '⌉': '\\rceil', '\\': '\\backslash',
+    };
+    return delimiters[text] || text;
+  }
+
+  function parseKatexMinner(element) {
+    const children = [...element.children].filter(node =>
+      isKatexElement(node) && !isKatexIgnored(node) && !isKatexScript(node));
+    const first = children[0];
+    const last = children[children.length - 1];
+    const hasOpen = first && hasKatexClass(first, 'mopen');
+    const hasClose = last && hasKatexClass(last, 'mclose');
+
+    if (children.length >= 2 && hasOpen && hasClose) {
+      const left = parseKatexDelimiter(first);
+      const right = parseKatexDelimiter(last);
+      const middlePieces = children.slice(1, -1).map(convertKatexElement).filter(piece => piece.text);
+      const middle = joinKatexPieces(middlePieces);
+      const leftCommand = left === '.' ? '\\left.' : `\\left${left}`;
+      const rightCommand = right === '.' ? '\\right.' : `\\right${right}`;
+      return { text: `${leftCommand}${middle}${rightCommand}`, needsGroup: false };
+    }
+
+    return convertKatexChildren(element);
+  }
+
+  function parseKatexLimitsOp(element) {
+    let vlist = null;
+    for (const child of element.children) {
+      if (!hasKatexClass(child, 'vlist-t')) continue;
+      for (const child2 of child.children) {
+        if (!hasKatexClass(child2, 'vlist-r')) continue;
+        for (const child3 of child2.children) {
+          if (hasKatexClass(child3, 'vlist') &&
+              [...child3.children].some(row => /top:/.test(row.getAttribute?.('style') || ''))) {
+            vlist = child3;
+            break;
+          }
+        }
+        if (vlist) break;
+      }
+      if (vlist) break;
+    }
+
+    const rows = [];
+    if (vlist) {
+      for (const row of vlist.children) {
+        if (!isKatexElement(row)) continue;
+        const style = row.getAttribute?.('style') || '';
+        const match = style.match(/(?:^|;\s*)top:\s*(-?[\d.]+)em/);
+        if (!match) continue;
+        const text = convertKatexChildren(row).text;
+        if (text) rows.push({ top: Number(match[1]), text, element: row });
+      }
+    }
+
+    const operatorRow = rows.find(row =>
+      row.element.querySelector('.op-symbol') || /^(?:lim|max|min|det|gcd|sup|inf|Pr)$/.test(row.text)) ||
+      rows.find(row => !row.element.querySelector('.mtight'));
+
+    let sup = '';
+    let sub = '';
+    if (operatorRow) {
+      const above = rows.filter(row => row !== operatorRow && row.top < operatorRow.top);
+      const below = rows.filter(row => row !== operatorRow && row.top > operatorRow.top);
+      sup = above[above.length - 1]?.text || '';
+      sub = below[0]?.text || '';
+    }
+    const operator = operatorRow?.text || '';
+
+    let text = operator;
+    if (sub) text += formatKatexScriptArg('_', sub);
+    if (sup) text += formatKatexScriptArg('^', sup);
+    return { text, needsGroup: false };
+  }
+
+  function parseKatexMop(element) {
+    if (hasKatexClass(element, 'op-limits')) return parseKatexLimitsOp(element);
+    const converted = convertKatexChildren(element);
+    let text = converted.text;
+    if (!text || text.startsWith('\\')) return { text, needsGroup: false };
+
+    const match = text.match(/^([A-Za-z]+)(.*)$/);
+    const names = new Set([
+      'sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'log', 'ln', 'lim', 'det', 'gcd', 'Pr',
+      'sup', 'inf', 'max', 'min', 'arg', 'dim', 'exp', 'ker', 'deg', 'hom', 'limsup', 'liminf',
+    ]);
+    if (match && names.has(match[1])) return { text: `\\${match[1]}${match[2]}`, needsGroup: false };
+    return { text: `\\operatorname{${text}}`, needsGroup: false };
+  }
+
+  function convertKatexElement(element) {
+    if (!isKatexElement(element)) return { text: '', needsGroup: true };
+    const classes = getKatexClasses(element);
+
+    if (classes.includes('katex-html')) {
+      const bases = [...element.children].filter(node => hasKatexClass(node, 'base'));
+      return { text: joinKatexPieces(bases.map(base => convertKatexChildren(base)).filter(piece => piece.text)), needsGroup: true };
+    }
+    if (classes.includes('base')) return convertKatexChildren(element);
+    if (classes.includes('mfrac')) return parseKatexFrac(element);
+    if (classes.includes('sqrt')) return parseKatexSqrt(element);
+    if (classes.includes('minner')) return parseKatexMinner(element);
+    if (classes.includes('text')) {
+      return { text: `\\text{${convertKatexChildren(element).text}}`, needsGroup: false };
+    }
+    if (classes.includes('fbox')) {
+      return { text: `\\boxed{${convertKatexChildren(element).text}}`, needsGroup: false };
+    }
+    if (classes.includes('fcolorbox')) {
+      return { text: `\\boxed{${convertKatexChildren(element).text}}`, needsGroup: false };
+    }
+    if (classes.includes('mopen') || classes.includes('mclose')) {
+      return { text: parseKatexDelimiter(element), needsGroup: false };
+    }
+    if (classes.includes('mop')) return parseKatexMop(element);
+    if (classes.includes('msupsub')) {
+      const scripts = parseKatexScripts(element);
+      return { text: `${scripts.sub ? formatKatexScriptArg('_', scripts.sub) : ''}${scripts.sup ? formatKatexScriptArg('^', scripts.sup) : ''}`, needsGroup: false };
+    }
+    if (classes.includes('mtable')) return parseKatexTable(element);
+    if (classes.includes('overline')) return parseKatexOverline(element, 'overline');
+    if (classes.includes('underline')) return parseKatexOverline(element, 'underline');
+    if (classes.includes('accent')) return parseKatexAccent(element);
+    if (isKatexTransparent(element)) return convertKatexChildren(element);
+
+    if (classes.includes('mord')) {
+      const hasSemanticChildren = [...element.children].some(node =>
+        isKatexElement(node) && !isKatexIgnored(node) && !isKatexTransparent(node));
+      if (!hasSemanticChildren) {
+        return { text: mapKatexText(element.textContent, classes), needsGroup: false };
+      }
+      if (element.querySelector('.mfrac')) {
+        return parseKatexFrac(element.querySelector('.mfrac'));
+      }
+      if (element.querySelector('.sqrt')) {
+        return parseKatexSqrt(element.querySelector('.sqrt'));
+      }
+      return convertKatexChildren(element);
+    }
+
+    if (classes.some(name => [
+      'mbin', 'mrel', 'mpunct', 'mathnormal', 'mathcal', 'mathbb', 'mathbf', 'boldsymbol',
+      'mathrm', 'mathit', 'mathsf', 'mathtt', 'mathfrak', 'mathscr',
+    ].includes(name))) {
+      const hasSemanticChildren = [...element.children].some(node =>
+        isKatexElement(node) && !isKatexIgnored(node));
+      if (!hasSemanticChildren) {
+        return { text: mapKatexText(element.textContent, classes), needsGroup: false };
+      }
+    }
+
+    return convertKatexChildren(element);
   }
 
   function cleanLatexCandidate(text) {
@@ -3472,9 +4044,11 @@ ${text}\n\
 
   function looksLikeLatex(text) {
     if (!text) return false;
-    if (/[\\_^{}]/.test(text)) return true;
-    if (/\b(frac|sqrt|sum|int|alpha|beta|gamma|sin|cos|tan|cdot|times|leq|geq)\b/.test(text)) return true;
-    if (/^[0-9A-Za-z+\-*/=().,\s]+$/.test(text) && /[=+\-*/^]/.test(text)) return true;
+    const value = String(text).trim();
+    if (!value || /[\u200B-\u200D\uFEFF]/.test(value)) return false;
+    if (/[\\_{}]/.test(value)) return true;
+    if (/\b(frac|sqrt|sum|int|alpha|beta|gamma|sin|cos|tan|cdot|times|leq|geq)\b/.test(value)) return true;
+    if (/^[0-9A-Za-z+\-*/=().,\s^]+$/.test(value) && /[=+\-*/^]/.test(value)) return true;
     return false;
   }
 })();

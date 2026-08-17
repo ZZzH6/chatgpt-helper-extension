@@ -9,8 +9,6 @@
     lineHeight: 1.7,
     paragraphSpacing: 0.8,
     draftSaveEnabled: true,
-    notificationsEnabled: false,
-    shortcutsEnabled: true,
   });
 
   function clampNumber(value, min, max, fallback, precision = 0) {
@@ -36,8 +34,6 @@
       lineHeight: clampNumber(values.lineHeight, 1.35, 2.1, DEFAULTS.lineHeight, 2),
       paragraphSpacing: clampNumber(values.paragraphSpacing, 0.2, 1.6, DEFAULTS.paragraphSpacing, 2),
       draftSaveEnabled: values.draftSaveEnabled !== false,
-      notificationsEnabled: values.notificationsEnabled === true,
-      shortcutsEnabled: values.shortcutsEnabled !== false,
     };
   }
 
