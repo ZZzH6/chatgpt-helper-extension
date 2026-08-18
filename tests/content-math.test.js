@@ -47,6 +47,52 @@ helpers.extractLatexFromNode = extractLatexFromNode;`;
   return helpers;
 }
 
+function loadFormulaFinder() {
+  const source = fs.readFileSync(contentPath, 'utf8');
+  const start = source.indexOf('  function findFormulaNode(target) {');
+  const end = source.lastIndexOf('\n})();');
+  assert.notEqual(start, -1, 'findFormulaNode should exist in content.js');
+  assert.ok(end > start, 'formula finder helpers should follow findFormulaNode');
+
+  const helpers = {};
+  const prelude = `
+const FORMULA_SELECTORS = [
+  '.katex', '.katex-display', 'mjx-container', 'math', '[data-tex]', '[data-latex]',
+  '[data-math]', '[data-mathml]', '[data-math-mode]', '[data-formula]',
+  '[data-testid*="math"]', '[role="math"]', '[aria-roledescription="math"]',
+  '.math', '.math-inline', '.math-display', '.math-block', '.math-container',
+  '.MathJax_Display', '.MathJax',
+].join(',');
+let settings = { copyMode: 'latex' };
+let hoveredFormulaNode = null;
+let formulaFeedbackEl = null;
+let formulaFeedbackTimer = null;
+const navigator = { clipboard: { writeText: async () => {} } };
+const window = { innerWidth: 1280, innerHeight: 720, clearTimeout() {}, setTimeout() {} };
+function normalizeWhitespace(text) {
+  return String(text || '').replace(/\\s+/g, ' ').trim();
+}
+function normalizeCopyMode(mode) {
+  return mode === 'markdown' || mode === 'word' ? mode : 'latex';
+}
+function ensureFormulaUi() {
+  formulaFeedbackEl = {
+    hidden: false,
+    classList: { add() {}, remove() {} },
+    style: {},
+    getBoundingClientRect: () => ({ width: 0, height: 0 }),
+  };
+}
+function showToast() {}
+`;
+  const segment = `${prelude}${source.slice(start, end)}
+helpers.findFormulaNode = findFormulaNode;
+helpers.handleFormulaClick = handleFormulaClick;
+helpers.isVisibleFormulaCandidate = isVisibleFormulaCandidate;`;
+  new Function('Element', 'Node', 'helpers', segment)(linkedom.Element, linkedom.Node, helpers);
+  return helpers;
+}
+
 function loadLatexCopyNormalizer() {
   const source = fs.readFileSync(contentPath, 'utf8');
   const start = source.indexOf('  function normalizeLatexForCopy(latex) {');
@@ -113,6 +159,31 @@ const katexMathmlFixture = `
 </mrow></semantics></math>`;
 
 const expected = '\\left.\\frac{d}{dy}f(x_0,y)\\right|_{y=y_0}=f_y(x_0,y_0)=0';
+
+test('accepts a simple KaTeX HTML-only formula without LaTeX syntax markers', { skip: !linkedom }, () => {
+  const { document } = linkedom.parseHTML(`
+    <div><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base">
+      <span class="mord mathnormal">F</span><span class="mopen">(</span>
+      <span class="mord mathnormal">a</span><span class="mord mathnormal">x</span>
+      <span class="mbin">-</span><span class="mord mathnormal">b</span><span class="mord mathnormal">z</span>
+      <span class="mpunct">,</span><span class="mord mathnormal">a</span><span class="mord mathnormal">y</span>
+      <span class="mbin">-</span><span class="mord mathnormal">c</span><span class="mord mathnormal">z</span>
+      <span class="mclose">)</span><span class="mrel">=</span><span class="mord">0</span>
+    </span></span></span></div>`);
+  const helpers = loadLatexExtractor();
+  assert.equal(helpers.extractLatexFromNode(document.querySelector('.katex')), 'F(ax-bz,ay-cz)=0');
+});
+
+test('accepts a simple structured MathML formula without LaTeX syntax markers', { skip: !linkedom }, () => {
+  const { document } = linkedom.parseHTML(`
+    <div><math><mrow>
+      <mi>F</mi><mo>(</mo><mi>a</mi><mi>x</mi><mo>-</mo><mi>b</mi><mi>z</mi>
+      <mo separator="true">,</mo><mi>a</mi><mi>y</mi><mo>-</mo><mi>c</mi><mi>z</mi>
+      <mo>)</mo><mo>=</mo><mn>0</mn>
+    </mrow></math></div>`);
+  const helpers = loadLatexExtractor();
+  assert.equal(helpers.extractLatexFromNode(document.querySelector('math')), 'F(ax-bz,ay-cz)=0');
+});
 
 test('converts KaTeX HTML-only formula back to exact LaTeX', { skip: !linkedom }, () => {
   const { document } = linkedom.parseHTML(`<div>${katexHtmlFixture}</div>`);
@@ -223,4 +294,74 @@ test('prefers KaTeX presentation when assistive MathML is incomplete', { skip: !
     </span></div>`);
   const helpers = loadLatexExtractor();
   assert.equal(helpers.extractLatexFromNode(document.querySelector('.katex')), '\\boxed{x}');
+});
+
+test('findFormulaNode returns a visible formula with no currently extractable source', { skip: !linkedom }, () => {
+  const { document } = linkedom.parseHTML(`
+    <div><mjx-container><svg><text>F(ax-bz,ay-cz)=0</text></svg></mjx-container></div>`);
+  const formula = document.querySelector('mjx-container');
+  formula.getBoundingClientRect = () => ({ width: 120, height: 24 });
+  const helpers = loadFormulaFinder();
+  assert.equal(helpers.findFormulaNode(formula.querySelector('text')), formula);
+});
+
+test('findFormulaNode ignores hidden assistive MathML and returns its visible wrapper', { skip: !linkedom }, () => {
+  const { document } = linkedom.parseHTML(`
+    <div><span class="katex">
+      <span class="katex-mathml"><math><semantics><mrow><mi>x</mi></mrow></semantics></math></span>
+      <span class="katex-html" aria-hidden="true"><span class="base"><span class="mord">x</span></span></span>
+    </span></div>`);
+  const wrapper = document.querySelector('.katex');
+  const math = document.querySelector('math');
+  wrapper.getBoundingClientRect = () => ({ width: 18, height: 18 });
+  math.getBoundingClientRect = () => ({ width: 0, height: 0 });
+  const helpers = loadFormulaFinder();
+  assert.equal(helpers.findFormulaNode(math), wrapper);
+  assert.equal(helpers.isVisibleFormulaCandidate(math), false);
+});
+
+test('does not cancel a click when a visible formula has no copyable source', { skip: !linkedom }, async () => {
+  const { document } = linkedom.parseHTML(
+    `<div><mjx-container><svg><text>F(ax-bz,ay-cz)=0</text></svg></mjx-container></div>`,
+  );
+  const formula = document.querySelector('mjx-container');
+  const event = {
+    button: 0,
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    preventDefaultCalled: 0,
+    stopPropagationCalled: 0,
+    preventDefault() { this.preventDefaultCalled += 1; },
+    stopPropagation() { this.stopPropagationCalled += 1; },
+  };
+  const helpers = loadFormulaFinder();
+  await helpers.handleFormulaClick(event, formula);
+  assert.equal(event.preventDefaultCalled, 0);
+  assert.equal(event.stopPropagationCalled, 0);
+});
+
+test('cancels and handles a click when a formula has trusted source', { skip: !linkedom }, async () => {
+  const { document } = linkedom.parseHTML(
+    `<div><span class="katex" data-tex="x^2"><span class="katex-html"><span class="base"><span class="mord">x</span></span></span></span></div>`,
+  );
+  const formula = document.querySelector('.katex');
+  const event = {
+    button: 0,
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    clientX: 20,
+    clientY: 20,
+    preventDefaultCalled: 0,
+    stopPropagationCalled: 0,
+    preventDefault() { this.preventDefaultCalled += 1; },
+    stopPropagation() { this.stopPropagationCalled += 1; },
+  };
+  const helpers = loadFormulaFinder();
+  await helpers.handleFormulaClick(event, formula);
+  assert.equal(event.preventDefaultCalled, 1);
+  assert.equal(event.stopPropagationCalled, 1);
 });

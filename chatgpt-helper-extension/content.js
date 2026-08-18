@@ -3038,18 +3038,18 @@ ${text}\n\
       current = current.parentElement;
     }
 
-    // Prefer the first formula wrapper that contains usable source and has a
-    // visible box. MathML assistive nodes are often hidden inside KaTeX or
-    // MathJax, so selecting them first would make the button disappear.
-    let fallback = null;
-    const visibleCandidates = [];
-    for (const candidate of candidates) {
-      if (!extractLatexFromNode(candidate)) continue;
-      if (!fallback) fallback = candidate;
-      const rect = candidate.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) visibleCandidates.push(candidate);
-    }
-    return visibleCandidates.find(isDisplayFormula) || visibleCandidates[0] || fallback;
+    // Hover hit-testing is deliberately independent from LaTeX extraction.
+    // A rendered formula can still be copied through a later extraction path,
+    // while rejecting it here makes the hover affordance appear intermittent.
+    // MathML assistive nodes are usually nested inside the visible wrapper and
+    // must never win the hit test themselves.
+    const visibleCandidates = candidates.filter(isVisibleFormulaCandidate);
+    if (!visibleCandidates.length) return null;
+
+    // Prefer the block-level wrapper when the pointer is inside a nested
+    // KaTeX/MathJax element. This keeps the highlight stable across the whole
+    // displayed formula instead of jumping between implementation nodes.
+    return visibleCandidates.find(isDisplayFormula) || visibleCandidates[0];
   }
 
   async function handleFormulaClick(event, node = event.currentTarget) {
@@ -3058,11 +3058,14 @@ ${text}\n\
 
     if (!(node instanceof Element)) return;
 
-    event.preventDefault();
-    event.stopPropagation();
-
+    // Hover targeting is intentionally independent from extraction. If this
+    // rendered formula has no trustworthy source, let the page handle its
+    // click normally instead of swallowing the event.
     const latex = extractLatexFromNode(node);
     if (!latex) return;
+
+    event.preventDefault();
+    event.stopPropagation();
 
     setFormulaHover(node);
     try {
@@ -3267,20 +3270,26 @@ ${text}\n\
 
     for (const sourceNode of sourceNodes) {
       const explicitCandidates = [
-        sourceNode.getAttribute('data-math'),
-        sourceNode.getAttribute('data-tex'),
-        sourceNode.getAttribute('data-latex'),
-        sourceNode.getAttribute('latex'),
-        sourceNode.getAttribute('data-math-source'),
-        sourceNode.getAttribute('data-tex-source'),
-      ].filter(Boolean);
+        ['data-math', sourceNode.getAttribute('data-math'), false],
+        ['data-tex', sourceNode.getAttribute('data-tex'), true],
+        ['data-latex', sourceNode.getAttribute('data-latex'), true],
+        ['latex', sourceNode.getAttribute('latex'), true],
+        ['data-math-source', sourceNode.getAttribute('data-math-source'), true],
+        ['data-tex-source', sourceNode.getAttribute('data-tex-source'), true],
+      ].filter(([, value]) => value);
 
-      for (const candidate of explicitCandidates) {
+      for (const [, candidate, isExplicitSource] of explicitCandidates) {
         const cleaned = cleanLatexCandidate(candidate);
         // On a rendered formula, an attribute can still be an accessibility or
-        // display-text label. Only accept it as source when it has LaTeX syntax.
-        // This keeps a plain value such as "dydf(x0,y)..." out of the clipboard.
-        if (cleaned && (looksLikeLatexSource(cleaned) || !hasFormulaRenderingEvidence(sourceNode))) return cleaned;
+        // display-text label. Accept simple attributes only when they belong to
+        // a real renderer; this keeps a plain value such as "dydf(x0,y)..."
+        // out of the clipboard while preserving trusted simple source.
+        if (cleaned && !isGenericFormulaLabel(cleaned) && (
+          looksLikeLatexSource(cleaned) ||
+          isExplicitSource ||
+          !hasFormulaRenderingEvidence(sourceNode) ||
+          hasTrustedSourceRendering(sourceNode)
+        )) return cleaned;
       }
     }
 
@@ -3321,7 +3330,8 @@ ${text}\n\
     // more faithfully. Use it before trying to reverse-convert MathML.
     if (hasKatexRendering) {
       const convertedKatex = katexHtmlToLatex(node);
-      if (looksLikeLatexSource(convertedKatex)) return convertedKatex;
+      const reliableKatex = acceptConvertedFormula(convertedKatex, 'katex', node);
+      if (reliableKatex) return reliableKatex;
     }
 
     const mathml = node.matches('math') ? node : node.querySelector('mjx-assistive-mml math, .katex-mathml math, math');
@@ -3333,16 +3343,20 @@ ${text}\n\
       ].filter(Boolean);
       for (const candidate of mathmlSourceCandidates) {
         const cleaned = cleanLatexCandidate(candidate);
-        if (looksLikeLatexSource(cleaned)) return cleaned;
+        if (!isGenericFormulaLabel(cleaned) && (looksLikeLatexSource(cleaned) || hasStructuredMathMlContent(mathml))) {
+          return cleaned;
+        }
       }
     }
 
     const convertedMathml = mathMlToLatex(mathml);
-    if (looksLikeLatexSource(convertedMathml)) return convertedMathml;
+    const reliableMathml = acceptConvertedFormula(convertedMathml, 'mathml', mathml);
+    if (reliableMathml) return reliableMathml;
 
     if (hasRenderedFormula && !hasKatexRendering) {
       const convertedKatex = katexHtmlToLatex(node);
-      if (looksLikeLatexSource(convertedKatex)) return convertedKatex;
+      const reliableKatex = acceptConvertedFormula(convertedKatex, 'katex', node);
+      if (reliableKatex) return reliableKatex;
     }
 
     // Never reverse-engineer a rendered formula from textContent. It loses
@@ -3355,6 +3369,126 @@ ${text}\n\
     }
 
     return '';
+  }
+
+  function isVisibleFormulaCandidate(candidate) {
+    if (!(candidate instanceof Element)) return false;
+    if (isAssistiveMathNode(candidate) || !isElementVisible(candidate)) return false;
+
+    if (candidate.matches('.katex, .katex-display, mjx-container, .MathJax, .MathJax_Display')) {
+      return hasVisibleFormulaStructure(candidate);
+    }
+    if (candidate.matches('math')) {
+      return hasStructuredMathMlContent(candidate);
+    }
+
+    // Generic formula selectors (data-math, .math, role=math, etc.) are only
+    // visual formula wrappers when they contain an actual renderer. A plain
+    // text label must not become a clickable formula target.
+    return hasVisibleFormulaStructure(candidate);
+  }
+
+  function isAssistiveMathNode(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.matches('mjx-assistive-mml, .katex-mathml')) return true;
+    if (node.matches('math') && node.closest('mjx-assistive-mml, .katex-mathml')) return true;
+    return false;
+  }
+
+  function isElementVisible(node, allowZeroLayout = false) {
+    if (!(node instanceof Element)) return false;
+
+    let current = node;
+    while (current instanceof Element) {
+      // KaTeX marks its visual HTML tree aria-hidden because the sibling
+      // MathML tree is used by screen readers. It remains the visible tree
+      // and must not be mistaken for hidden assistive MathML.
+      if (current.hidden || (current.getAttribute('aria-hidden') === 'true' && !current.matches('.katex-html'))) {
+        return false;
+      }
+      const style = current.getAttribute('style') || '';
+      if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden|content-visibility\s*:\s*hidden)/i.test(style)) {
+        return false;
+      }
+      current = current.parentElement;
+    }
+
+    if (typeof getComputedStyle === 'function') {
+      const computed = getComputedStyle(node);
+      if (computed.display === 'none' || computed.visibility === 'hidden' || computed.contentVisibility === 'hidden') {
+        return false;
+      }
+    }
+
+    const rect = node.getBoundingClientRect?.();
+    if (rect && (rect.width > 0 || rect.height > 0)) return true;
+    const clientRects = node.getClientRects?.();
+    if (clientRects?.length) return true;
+
+    if (allowZeroLayout) return true;
+
+    // DOM-only environments (and detached test fixtures) have no layout box.
+    // Structural checks above still distinguish a renderer from plain text.
+    return !node.isConnected || typeof node.getBoundingClientRect !== 'function';
+  }
+
+  function hasVisibleFormulaStructure(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.matches('.katex-html, mjx-container, .MathJax, .MathJax_Display')) return true;
+
+    const visibleRenderer = [...node.querySelectorAll(
+      '.katex-html, mjx-container, .MathJax, .MathJax_Display, math',
+    )].find(renderer => !isAssistiveMathNode(renderer) && isElementVisible(renderer, true));
+    return !!visibleRenderer;
+  }
+
+  function hasStructuredMathMlContent(math) {
+    if (!(math instanceof Element) || math.localName !== 'math') return false;
+    return !!math.querySelector([
+      'mi', 'mn', 'mo', 'mfrac', 'msqrt', 'mroot', 'msub', 'msup', 'msubsup',
+      'munder', 'mover', 'munderover', 'mfenced', 'menclose', 'mtable', 'mtr', 'mtd',
+    ].join(','));
+  }
+
+  /*
+   * Keep this helper separate from `looksLikeLatexSource`: syntax heuristics
+   * are appropriate for untrusted attributes, but a converter result is
+   * trustworthy when it came from a real KaTeX or MathML tree. This is what
+   * allows simple formulas such as F(ax-bz, ay-cz)=0 without trusting arbitrary
+   * textContent.
+   */
+  function acceptConvertedFormula(text, kind, sourceNode) {
+    const cleaned = cleanLatexCandidate(text);
+    if (!cleaned || isGenericFormulaLabel(cleaned)) return '';
+    if (looksLikeLatexSource(cleaned)) return cleaned;
+    if (kind === 'katex') {
+      return hasVisibleKatexStructure(sourceNode) ? cleaned : '';
+    }
+    if (kind === 'mathml') {
+      return hasStructuredMathMlContent(sourceNode) ? cleaned : '';
+    }
+    return '';
+  }
+
+  function hasVisibleKatexStructure(node) {
+    if (!(node instanceof Element)) return false;
+    const html = node.matches('.katex-html') ? node : node.querySelector('.katex-html');
+    if (!html || isAssistiveMathNode(html) || !isElementVisible(html, true)) return false;
+    return !!html.querySelector('.base');
+  }
+
+  function hasRenderedFormulaDescendant(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.matches('.katex-html, mjx-container, .MathJax, .MathJax_Display')) return true;
+    if (node.matches('math')) return hasStructuredMathMlContent(node);
+    return [...node.querySelectorAll('.katex-html, mjx-container, .MathJax, .MathJax_Display, math')]
+      .some(renderer => !isAssistiveMathNode(renderer) && (
+        renderer.matches('math') ? hasStructuredMathMlContent(renderer) : true
+      ));
+  }
+
+  function hasTrustedSourceRendering(sourceNode) {
+    return hasRenderedFormulaDescendant(sourceNode);
   }
 
   function looksLikeLatexSource(text) {
