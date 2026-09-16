@@ -1102,6 +1102,12 @@ ${text}\n\
         background: transparent;
       }
 
+      .cgh-print-content .cgh-export-syntax-token {
+        color: var(--cgh-syntax-color, #f4f4f5) !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
       .cgh-print-content :not(pre) > code,
       .cgh-print-content :not(pre) > .cgh-export-code {
         padding: 1pt 3pt;
@@ -1472,6 +1478,8 @@ ${text}\n\
     const source = findMessageContentNode(node) || node;
     const clone = source.cloneNode(true);
 
+    preserveCodeSyntaxStyles(source, clone);
+
     clone.querySelectorAll([
       '#cgh-panel',
       '#cgh-toast',
@@ -1487,6 +1495,46 @@ ${text}\n\
     stripInlineInteractionAttributes(clone);
     normalizeExportContent(clone);
     return clone;
+  }
+
+  function preserveCodeSyntaxStyles(source, clone, styleResolver = null) {
+    if (!(source instanceof Element) || !(clone instanceof Element)) return;
+
+    const sourceView = source.ownerDocument?.defaultView;
+    const resolveStyle = styleResolver
+      || (typeof sourceView?.getComputedStyle === 'function'
+        ? sourceView.getComputedStyle.bind(sourceView)
+        : null);
+    if (!resolveStyle) return;
+
+    const sourceBlocks = [...source.querySelectorAll('pre')];
+    const clonedBlocks = [...clone.querySelectorAll('pre')];
+
+    sourceBlocks.forEach((sourceBlock, blockIndex) => {
+      const clonedBlock = clonedBlocks[blockIndex];
+      if (!clonedBlock) return;
+
+      const sourceCode = sourceBlock.querySelector('code') || sourceBlock;
+      const clonedCode = clonedBlock.querySelector('code') || clonedBlock;
+      const sourceTokens = [sourceCode, ...sourceCode.querySelectorAll('*')];
+      const clonedTokens = [clonedCode, ...clonedCode.querySelectorAll('*')];
+
+      sourceTokens.forEach((sourceToken, tokenIndex) => {
+        const clonedToken = clonedTokens[tokenIndex];
+        if (!clonedToken || sourceToken.tagName !== clonedToken.tagName) return;
+
+        let color = '';
+        try {
+          color = resolveStyle(sourceToken)?.color || '';
+        } catch (error) {
+          return;
+        }
+
+        if (!color || color === 'transparent' || color === 'rgba(0, 0, 0, 0)') return;
+        clonedToken.classList.add('cgh-export-syntax-token');
+        clonedToken.style.setProperty('--cgh-syntax-color', color);
+      });
+    });
   }
 
   function findMessageContentNode(node) {
