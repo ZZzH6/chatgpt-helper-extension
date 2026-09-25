@@ -101,6 +101,7 @@
       }
       footer { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding-top: 10px; }
       #status { min-height: 16px; color: var(--accent); font-size: 12px; }
+      #diagnostics { grid-column: 1 / -1; color: var(--muted); font: 11px/1.4 Consolas, "Microsoft YaHei", sans-serif; overflow-wrap: anywhere; white-space: pre-line; }
       button {
         padding: 8px 16px;
         border: 0;
@@ -174,6 +175,7 @@
     <footer>
       <div id="status" role="status"></div>
       <button id="saveBtn" type="button">保存</button>
+      <div id="diagnostics" hidden></div>
     </footer>
 
     <script src="toolkit-utils.js"></script>

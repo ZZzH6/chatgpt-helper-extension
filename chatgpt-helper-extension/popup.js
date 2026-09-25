@@ -46,11 +46,83 @@ async function loadSettings() {
   renderSettings(await chrome.storage.sync.get(DEFAULTS));
 }
 
+function isChatGptTab(tab) {
+  if (!tab?.id || !tab.url) return false;
+  try {
+    const url = new URL(tab.url);
+    return url.protocol === 'https:' && (
+      url.hostname === 'chatgpt.com' ||
+      url.hostname.endsWith('.chatgpt.com') ||
+      url.hostname === 'chat.openai.com'
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function saveSettings() {
-  await chrome.storage.sync.set(readSettings());
   const status = getField('status');
-  status.textContent = '已保存';
-  window.setTimeout(() => { status.textContent = ''; }, 1400);
+  const diagnostics = getField('diagnostics');
+  diagnostics.hidden = true;
+  diagnostics.textContent = '';
+  const button = getField('saveBtn');
+  button.disabled = true;
+  try {
+    const settings = readSettings();
+    await chrome.storage.sync.set(settings);
+    status.textContent = '已保存';
+    let tab;
+    try {
+      [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    } catch {
+      status.textContent = '已保存，请刷新聊天页';
+      return;
+    }
+    if (!isChatGptTab(tab)) {
+      status.textContent = '已保存，打开聊天页后生效';
+      return;
+    }
+
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, { type: 'cgh:apply-settings', settings });
+      if (!response?.applied || response.readingEngineVersion !== 6 || !Number.isInteger(response.readingTargets)
+        || !Number.isInteger(response.navigationTargets)
+        || (settings.readingEnabled && typeof response.diagnostics?.route !== 'string')) {
+        throw new Error('Content script did not confirm settings');
+      }
+      if (settings.readingEnabled && response.diagnostics) {
+        const info = response.diagnostics;
+        diagnostics.textContent = `页面 ${info.route} · main文字 ${info.mainChars} · 段落 ${info.paragraphs} · iframe ${info.frames}\n定位 ${info.source} · section ${info.sections} · role ${info.roles} · turn ${info.legacyTurns} · markdown ${info.markdown} · width ${response.widthTargets}`;
+        diagnostics.textContent += `\n导航 ${response.navigationTargets} (${response.navigationSource}) · message-id ${info.messageIds} · 操作锚点 ${info.actions}`;
+        diagnostics.textContent += `\n文字 ${info.textTargets} · 段距 ${info.spacingTargets} · 原字号 ${info.baseFontSize ?? '-'}→${info.fontSize ?? '-'}px · 行高 ${info.lineHeight ?? '-'} · 段距 ${info.marginBlock ?? '-'}`;
+        diagnostics.hidden = false;
+      }
+      if (settings.readingEnabled && response.readingTargets === 0) {
+        status.textContent = response.diagnostics?.route === 'conversation'
+          ? '已保存，未找到聊天正文'
+          : '已保存，当前不是对话页';
+      } else if (settings.readingEnabled && !response.readingVerified) {
+        status.textContent = '已保存，但排版未生效';
+      } else if (settings.readingEnabled && response.widthTargets === 0) {
+        status.textContent = '已保存，宽度容器未识别';
+      } else if (response.navigationTargets === 0 && /(?:^|\/)c\/[^/]+/.test(new URL(tab.url).pathname)) {
+        status.textContent = '已保存，但对话导航未找到消息';
+      } else {
+        status.textContent = '已保存，聊天页已更新';
+      }
+    } catch {
+      try {
+        await chrome.tabs.reload(tab.id);
+        status.textContent = '已保存，正在刷新聊天页';
+      } catch {
+        status.textContent = '已保存，请手动刷新聊天页';
+      }
+    }
+  } catch (error) {
+    status.textContent = `保存失败：${error.message || error}`;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 document.querySelectorAll('input[type="range"]').forEach((input) => {

@@ -222,28 +222,25 @@
 
 #cgh-panel .cgh-empty { padding: 20px 8px; color: #8f9a94; font-size: 11px; text-align: center; }
 
-.cgh-target-message {
-  outline: 3px solid rgba(96, 165, 250, 0.9) !important;
-  outline-offset: 4px !important;
-  box-shadow: 0 0 0 6px rgba(96, 165, 250, 0.12) !important;
-  border-radius: 14px;
+.cgh-message-outline {
+  position: absolute;
+  z-index: 2147483646;
+  box-sizing: border-box;
+  pointer-events: none;
+  border: 3px solid rgba(96, 165, 250, 0.94);
+  border-radius: 16px;
+  box-shadow: 0 0 0 6px rgba(96, 165, 250, 0.14);
+}
+
+.cgh-message-outline[hidden] { display: none !important; }
+
+.cgh-target-outline {
+  border-color: rgba(147, 197, 253, 0.98);
+  box-shadow: 0 0 0 7px rgba(96, 165, 250, 0.18);
 }
 
 .cgh-export-mode .cgh-export-selectable {
   cursor: pointer;
-}
-
-.cgh-export-mode .cgh-export-selectable:hover {
-  outline: 2px solid rgba(147, 197, 253, 0.72) !important;
-  outline-offset: 4px !important;
-  border-radius: 14px;
-}
-
-.cgh-export-selected {
-  outline: 3px solid rgba(52, 211, 153, 0.95) !important;
-  outline-offset: 4px !important;
-  box-shadow: 0 0 0 7px rgba(16, 185, 129, 0.16) !important;
-  border-radius: 14px;
 }
 
 .cgh-export-canvas {
@@ -632,28 +629,6 @@
   box-shadow: 0 10px 28px rgba(0,0,0,.2);
 }
 
-.cgh-reading-enabled main article,
-.cgh-reading-enabled main [data-message-author-role] {
-  width: min(100%, var(--cgh-reading-width)) !important;
-  max-width: var(--cgh-reading-width) !important;
-  margin-inline: auto !important;
-}
-
-.cgh-reading-enabled main .markdown,
-.cgh-reading-enabled main [data-message-author-role] {
-  font-size: calc(1rem * var(--cgh-font-scale)) !important;
-  line-height: var(--cgh-line-height) !important;
-}
-
-.cgh-reading-enabled main .markdown p,
-.cgh-reading-enabled main .markdown ul,
-.cgh-reading-enabled main .markdown ol,
-.cgh-reading-enabled main .markdown blockquote,
-.cgh-reading-enabled main .markdown pre,
-.cgh-reading-enabled main .markdown table {
-  margin-block: var(--cgh-paragraph-spacing) !important;
-}
-
 @media (max-width: 720px) {
   #cgh-panel {
     right: 8px;
@@ -666,7 +641,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  #cgh-panel *,
-  .cgh-target-message,
-  .cgh-export-selected { transition: none !important; }
+  #cgh-panel * { transition: none !important; }
+}
+
+@media print {
+  .cgh-message-outline { display: none !important; }
 }

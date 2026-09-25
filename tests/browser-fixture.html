@@ -16,6 +16,9 @@
     </style>
     <script>
       const localData = {};
+      const syncData = new URLSearchParams(location.search).has('reading')
+        ? { readingEnabled: true, readingWidth: 1100, fontScale: 130, lineHeight: 1.8, paragraphSpacing: 1.2 }
+        : {};
       function readStore(store, keys) {
         if (keys == null) return { ...store };
         if (typeof keys === 'string') return { [keys]: store[keys] };
@@ -25,7 +28,7 @@
       globalThis.chrome = {
         storage: {
           sync: {
-            get: async keys => readStore({}, keys),
+            get: async keys => readStore(syncData, keys),
             set: async () => {},
           },
           local: {
@@ -35,7 +38,7 @@
           },
           onChanged: { addListener: () => {} },
         },
-        runtime: { sendMessage: async () => {} },
+        runtime: { sendMessage: async () => {}, onMessage: { addListener: () => {} } },
       };
     </script>
     <link rel="stylesheet" href="../chatgpt-helper-extension/styles.css" />
@@ -60,6 +63,11 @@
         <div class="markdown">
           <p>可以同时保留 LaTeX、Markdown 和 MathML。</p>
           <span class="katex"><math alttext="E = mc^2"><semantics><mrow><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">E = mc^2</annotation></semantics></math></span>
+        </div>
+      </article>
+      <article data-testid="conversation-turn-5">
+        <div class="max-w-(--thread-content-max-width)" style="max-width: 768px">
+          <div data-message-author-role="assistant"><div class="markdown"><p>排版检查文字</p></div></div>
         </div>
       </article>
     </main>

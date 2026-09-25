@@ -16,8 +16,15 @@
   let hoveredFormulaNode = null;
   let formulaListenersBound = false;
   let currentMessages = [];
+  let navigationSource = 'none';
   let highlightedMessageNode = null;
   let highlightedMessageTimer = null;
+  let highlightedMessageOutline = null;
+  let hoveredMessageOutline = null;
+  const selectedMessageOutlines = new Map();
+  const messageOutlineAnchors = new WeakMap();
+  let outlineTrackingBound = false;
+  let outlineUpdateQueued = false;
   let lastConversationMutationAt = performance.now();
   let jumpSequence = 0;
   let jumpRunning = false;
@@ -34,6 +41,9 @@
   let draftInput = null;
   let draftSaveTimer = null;
   let draftObserver = null;
+  const readingStyleBackup = new Map();
+  let readingBaseFontSizes = new WeakMap();
+  const inferredMessageRoles = new WeakMap();
   const selectedMessageSignatures = new Set();
   const CONVERSATION_READY_QUIET_MS = 500;
   const PRE_JUMP_SCROLL_IDLE_MS = 260;
@@ -47,7 +57,10 @@
   const COMPOSER_SELECTORS = '#prompt-textarea, textarea[data-id="root"], textarea, div[contenteditable="true"].ProseMirror';
 
   const MESSAGE_SELECTORS = [
+    'section[data-turn="user"]',
+    'section[data-turn="assistant"]',
     '[data-message-author-role]',
+    '[data-message-id]',
     'article[data-testid^="conversation-turn-"]',
     'main article',
     'main [role="article"]'
@@ -86,6 +99,7 @@
     applyReadingSettings();
     observeDom();
     attachStorageListener();
+    attachSettingsMessageListener();
     startDraftSave();
     scheduleRefresh();
     setInterval(scheduleRefresh, 5000);
@@ -103,6 +117,19 @@
       scheduleRefresh();
     });
     storageListenerAdded = true;
+  }
+
+  function attachSettingsMessageListener() {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message?.type !== 'cgh:apply-settings') return;
+      settings = normalizeSettings(message.settings);
+      const readingResult = applyReadingSettings();
+      if (settings.draftSaveEnabled) attachDraftInput();
+      currentMessages = collectMessages();
+      renderTimeline();
+      updateExportUi();
+      sendResponse({ applied: true, readingEngineVersion: 6, navigationTargets: currentMessages.length, navigationSource, ...readingResult });
+    });
   }
 
   function normalizeSettings(values) {
@@ -159,11 +186,14 @@
 
   function isRelevantNode(node) {
     if (!(node instanceof Element)) return false;
+    if (node.classList.contains('cgh-message-outline')) return false;
     if (node.id === 'cgh-panel' || node.id === 'cgh-toast' || node.id === 'cgh-formula-copy-feedback') return false;
     if (node.closest && (node.closest('#cgh-panel') || node.closest('#cgh-toast') || node.closest('#cgh-formula-copy-feedback'))) return false;
     return !!(
       node.matches?.(MESSAGE_SELECTORS.join(',')) ||
       node.querySelector?.(MESSAGE_SELECTORS.join(',')) ||
+      node.closest?.('main') ||
+      node.matches?.('main') ||
       node.matches?.(FORMULA_SELECTORS) ||
       node.querySelector?.(FORMULA_SELECTORS)
     );
@@ -176,6 +206,7 @@
 
   function refreshAll() {
     syncConversationState();
+    applyReadingSettings();
     ensurePanelAlive();
     ensureFormulaUi();
     const messages = collectMessages();
@@ -202,7 +233,7 @@
       <div class="cgh-header">
         <div class="cgh-title">对话导航</div>
         <div class="cgh-actions">
-          <button class="cgh-mini-btn" data-action="refresh">刷新</button>
+          <button class="cgh-mini-btn" data-action="refresh" title="重新扫描当前页面的消息，不刷新网页">更新列表</button>
           <button class="cgh-mini-btn" data-action="toggle">展开</button>
         </div>
       </div>
@@ -229,7 +260,10 @@
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
       const action = target.dataset.action;
-      if (action === 'refresh') refreshAll();
+      if (action === 'refresh') {
+        refreshAll();
+        showToast(`已重新扫描，找到 ${currentMessages.length} 条消息`);
+      }
       if (action === 'toggle') {
         panel.classList.toggle('cgh-hidden');
         target.textContent = panel.classList.contains('cgh-hidden') ? '展开' : '收起';
@@ -303,45 +337,116 @@
 
     nodes = nodes.filter(node => !node.closest('#cgh-panel') && !node.closest('#cgh-toast'));
     nodes = dedupeNodes(nodes);
-
-    const messages = [];
-    for (const node of nodes) {
-      const role = inferRole(node);
-      const text = extractTextWithLatex(node);
-      if (!text.trim() && !hasExportableImages(node)) continue;
-      messages.push({
-        role,
-        text,
-        node,
-        signature: buildMessageSignature(node, role, text),
-      });
+    const toMessages = candidates => {
+      const messages = [];
+      for (const node of candidates) {
+        const role = inferRole(node);
+        const text = extractTextWithLatex(node);
+        if (!text.trim() && !hasExportableImages(node)) continue;
+        messages.push({
+          role,
+          text,
+          node,
+          signature: buildMessageSignature(node, role, text),
+        });
+      }
+      return messages;
+    };
+    let messages = toMessages(nodes);
+    if (messages.length) {
+      navigationSource = 'message anchors';
+      return messages;
     }
-
+    messages = toMessages(findMessageNodesFromActions());
+    if (messages.length) {
+      navigationSource = 'copy actions';
+      return messages;
+    }
+    messages = toMessages(findGenericMessageNodes());
+    navigationSource = messages.length ? 'main text' : 'none';
     return messages;
   }
 
-  function dedupeNodes(nodes) {
-    return nodes.filter((node, index) => {
-      return !nodes.some((other, otherIndex) => {
-        if (index === otherIndex) return false;
-        return other.contains(node);
+  function findMessageNodesFromActions() {
+    const main = document.querySelector('main');
+    if (!main) return [];
+    const buttons = [...main.querySelectorAll('button[data-testid*="copy-turn"], button[aria-label^="复制"], button[aria-label^="Copy"], button[title^="复制"]')];
+    const nodes = [];
+    for (const button of buttons) {
+      if (button.closest('pre, code, form, nav, aside, header, footer, #cgh-panel')) continue;
+      for (let node = button.parentElement; node && node !== main; node = node.parentElement) {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, [role="button"], [role="tooltip"], .sr-only, svg').forEach(item => item.remove());
+        if (normalizeWhitespace(clone.textContent || '').length >= 2) {
+          nodes.push(node);
+          break;
+        }
+      }
+    }
+    return dedupeNodes(nodes.flatMap(splitActionMessageNode));
+  }
+
+  function splitActionMessageNode(node) {
+    const bubble = node.querySelector('.whitespace-pre-wrap');
+    if (!bubble) return [node];
+    const main = document.querySelector('main');
+    for (let branch = bubble; branch.parentElement && branch.parentElement !== main; branch = branch.parentElement) {
+      const siblings = [...branch.parentElement.children];
+      const following = siblings.slice(siblings.indexOf(branch) + 1);
+      const answer = following.find(sibling => {
+        if (!node.contains(sibling) && sibling.querySelector('.whitespace-pre-wrap')) return false;
+        const clone = sibling.cloneNode(true);
+        clone.querySelectorAll('button, [role="button"], [role="tooltip"], .sr-only, svg').forEach(item => item.remove());
+        const text = normalizeWhitespace(clone.textContent || '');
+        return text.length >= 2 && (text.length >= 10 || sibling.matches('p, article')
+          || sibling.querySelector('p, h1, h2, h3, h4, h5, h6, pre, blockquote, .katex, mjx-container'));
       });
+      if (answer) {
+        inferredMessageRoles.set(branch, 'user');
+        inferredMessageRoles.set(answer, 'assistant');
+        return [branch, answer];
+      }
+    }
+    return [node];
+  }
+
+  function findGenericMessageNodes() {
+    const main = document.querySelector('main');
+    if (!main || !/(?:^|\/)c\/[^/]+/.test(location.pathname)) return [];
+    const allowed = node => node.textContent.trim()
+      && !node.closest('form, nav, aside, header, footer, button, [contenteditable="true"], #cgh-panel, #cgh-toast');
+    const blockSelector = 'p, h1, h2, h3, h4, h5, h6, li, pre, blockquote';
+    const blocks = [...main.querySelectorAll(blockSelector)].filter(allowed);
+    const textLeaves = [...main.querySelectorAll('[dir="auto"], div, span')]
+      .filter(node => [...node.childNodes].some(child => child.nodeType === 3 && child.textContent.trim().length >= 4)
+        && allowed(node) && !node.closest(blockSelector) && !node.querySelector(blockSelector));
+    return dedupeNodes([...blocks, ...textLeaves]);
+  }
+
+  function dedupeNodes(nodes) {
+    const unique = [...new Set(nodes)];
+    const selected = new Set(unique);
+    return unique.filter(node => {
+      for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+        if (selected.has(parent)) return false;
+      }
+      return true;
     });
   }
 
   function inferRole(node) {
-    const role = node.getAttribute('data-message-author-role');
-    if (role) return role;
-
-    const text = (node.textContent || '').slice(0, 80);
-    if (/^(You|你|用户)\b/i.test(text)) return 'user';
-    return 'assistant';
+    const inferred = inferredMessageRoles.get(node);
+    if (inferred) return inferred;
+    const roleNode = node.closest('[data-turn], [data-message-author-role]') || node;
+    const role = roleNode.getAttribute('data-turn') || roleNode.getAttribute('data-message-author-role');
+    return role === 'user' || role === 'assistant' ? role : 'unknown';
   }
 
   function extractTextWithLatex(root) {
     const clone = root.cloneNode(true);
 
     clone.querySelectorAll('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback').forEach(el => el.remove());
+    clone.querySelectorAll('button, [role="button"], [role="tooltip"], [contenteditable="true"], .sr-only').forEach(el => el.remove());
 
     clone.querySelectorAll(FORMULA_SELECTORS).forEach((formulaNode) => {
       const latex = extractLatexFromNode(formulaNode);
@@ -393,7 +498,7 @@ ${text}\n\
         <div class="cgh-item${selected ? ' cgh-item-selected' : ''}${index === activeTimelineIndex ? ' cgh-item-active' : ''}" data-message-index="${index}">
           <button type="button" class="cgh-star-btn${starred ? ' cgh-starred' : ''}" data-action="toggle-star" title="${starred ? '取消星标' : '添加星标'}" aria-label="${starred ? '取消星标' : '添加星标'}" aria-pressed="${starred}">★</button>
           <button type="button" class="cgh-jump-btn" data-action="jump-message" aria-label="跳转到第 ${index + 1} 条消息">
-            <span class="cgh-role">${message.role === 'user' ? '你' : 'GPT'}</span>
+            <span class="cgh-role">${message.role === 'user' ? '你' : message.role === 'assistant' ? 'GPT' : '内容'}</span>
             <span class="cgh-preview">${escapeHtml(`${index + 1}. ${preview}`)}</span>
           </button>
         </div>`;
@@ -450,7 +555,36 @@ ${text}\n\
   function ensureExportSelectionListener() {
     if (exportClickListenerBound) return;
     document.addEventListener('click', handleExportSelectionClick, true);
+    document.addEventListener('pointerover', handleExportSelectionPointerOver, true);
+    document.addEventListener('pointerout', handleExportSelectionPointerOut, true);
     exportClickListenerBound = true;
+  }
+
+  function handleExportSelectionPointerOver(event) {
+    if (!exportSelectionMode || !(event.target instanceof Element)) return;
+    if (event.target.closest('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback')) return;
+    const message = currentMessages.find(item => item.node === event.target || item.node.contains(event.target));
+    if (!message || selectedMessageSignatures.has(message.signature)) {
+      clearHoveredMessageOutline();
+      return;
+    }
+    if (!hoveredMessageOutline) hoveredMessageOutline = createMessageOutline('cgh-hover-outline');
+    if (hoveredMessageOutline.node === message.node) return;
+    hoveredMessageOutline.node = message.node;
+    ensureMessageOutlineTracking();
+    scheduleMessageOutlineUpdate();
+  }
+
+  function handleExportSelectionPointerOut(event) {
+    if (!hoveredMessageOutline || !(event.target instanceof Element)) return;
+    const node = hoveredMessageOutline.node;
+    if (event.relatedTarget instanceof Element && node?.contains(event.relatedTarget)) return;
+    clearHoveredMessageOutline();
+  }
+
+  function clearHoveredMessageOutline() {
+    removeMessageOutline(hoveredMessageOutline);
+    hoveredMessageOutline = null;
   }
 
   function handleExportSelectionClick(event) {
@@ -473,6 +607,7 @@ ${text}\n\
   function setExportSelectionMode(enabled, options = {}) {
     exportSelectionMode = enabled;
     document.documentElement.classList.toggle('cgh-export-mode', exportSelectionMode);
+    if (!enabled) clearHoveredMessageOutline();
 
     if (!enabled && options.clearSelection) {
       selectedMessageSignatures.clear();
@@ -494,6 +629,7 @@ ${text}\n\
       selectedMessageSignatures.add(message.signature);
     }
 
+    clearHoveredMessageOutline();
     updateExportUi();
   }
 
@@ -558,11 +694,29 @@ ${text}\n\
   }
 
   function updateSelectedMessageClasses() {
+    const selected = new Set();
     for (const message of currentMessages) {
       if (!(message.node instanceof HTMLElement)) continue;
-      message.node.classList.toggle('cgh-export-selected', selectedMessageSignatures.has(message.signature));
+      const isSelected = selectedMessageSignatures.has(message.signature);
+      message.node.classList.toggle('cgh-export-selected', isSelected);
       message.node.classList.toggle('cgh-export-selectable', exportSelectionMode);
+      if (isSelected) {
+        selected.add(message.signature);
+        let outline = selectedMessageOutlines.get(message.signature);
+        if (!outline) {
+          outline = createMessageOutline('cgh-selected-outline');
+          selectedMessageOutlines.set(message.signature, outline);
+        }
+        outline.node = message.node;
+      }
     }
+    for (const [signature, outline] of selectedMessageOutlines) {
+      if (selected.has(signature)) continue;
+      removeMessageOutline(outline);
+      selectedMessageOutlines.delete(signature);
+    }
+    if (selected.size) ensureMessageOutlineTracking();
+    scheduleMessageOutlineUpdate();
   }
 
   function updateMessageListSelectionState() {
@@ -654,7 +808,7 @@ ${text}\n\
 
   function buildMessagesMarkdown(messages) {
     const sections = messages.map((message, index) => {
-      const role = message.role === 'user' ? '用户' : 'ChatGPT';
+      const role = message.role === 'user' ? '用户' : message.role === 'assistant' ? 'ChatGPT' : '内容';
       const contentRoot = findMessageContentNode(message.node) || message.node;
       const content = domToMarkdown(contentRoot).trim() || message.text.trim();
       return `## ${index + 1}. ${role}\n\n${content}`;
@@ -836,7 +990,7 @@ ${text}\n\
 
       const role = document.createElement('div');
       role.className = 'cgh-print-role';
-      role.textContent = `${index + 1}. ${message.role === 'user' ? '用户' : '助手'}`;
+      role.textContent = `${index + 1}. ${message.role === 'user' ? '用户' : message.role === 'assistant' ? '助手' : '内容'}`;
       section.appendChild(role);
 
       const contentWrap = document.createElement('div');
@@ -1392,7 +1546,7 @@ ${text}\n\
 
     const label = document.createElement('div');
     label.className = 'cgh-export-label';
-    label.textContent = message.role === 'user' ? '用户' : '助手';
+    label.textContent = message.role === 'user' ? '用户' : message.role === 'assistant' ? '助手' : '内容';
     wrapper.appendChild(label);
 
     const bubble = document.createElement('div');
@@ -1885,7 +2039,7 @@ ${text}\n\
       const bubbleHeight = bubblePaddingY * 2 + textHeight;
 
       return {
-        role: message.role === 'user' ? 'user' : 'assistant',
+        role: message.role,
         blocks: measuredBlocks,
         bubbleWidth,
         bubbleHeight,
@@ -1929,7 +2083,7 @@ ${text}\n\
       const isUser = message.role === 'user';
       const bubbleX = isUser ? width - padding - message.bubbleWidth : padding;
       const contentX = isUser ? bubbleX + bubblePaddingX : bubbleX;
-      const label = isUser ? '用户' : '助手';
+      const label = isUser ? '用户' : message.role === 'assistant' ? '助手' : '内容';
       const labelWidth = context.measureText(label).width;
 
       context.fillStyle = '#94a3b8';
@@ -2909,28 +3063,342 @@ ${text}\n\
       highlightedMessageTimer = null;
     }
 
-    if (highlightedMessageNode && highlightedMessageNode !== node) {
-      highlightedMessageNode.classList.remove('cgh-target-message');
-    }
-
     highlightedMessageNode = node;
-    node.classList.add('cgh-target-message');
+    if (!highlightedMessageOutline) highlightedMessageOutline = createMessageOutline('cgh-target-outline');
+    highlightedMessageOutline.node = node;
+    ensureMessageOutlineTracking();
+    scheduleMessageOutlineUpdate();
 
     highlightedMessageTimer = window.setTimeout(() => {
       if (highlightedMessageNode === node) {
-        node.classList.remove('cgh-target-message');
         highlightedMessageNode = null;
+        removeMessageOutline(highlightedMessageOutline);
+        highlightedMessageOutline = null;
       }
       highlightedMessageTimer = null;
     }, 1800);
   }
 
+  function createMessageOutline(kind) {
+    const element = document.createElement('div');
+    element.className = `cgh-message-outline ${kind}`;
+    element.setAttribute('aria-hidden', 'true');
+    element.hidden = true;
+    return { node: null, anchor: null, element };
+  }
+
+  function removeMessageOutline(outline) {
+    if (!outline) return;
+    outline.element.remove();
+    setMessageOutlineAnchor(outline, null);
+  }
+
+  function setMessageOutlineAnchor(outline, anchor) {
+    if (outline.anchor === anchor) return;
+    if (outline.anchor) {
+      const old = messageOutlineAnchors.get(outline.anchor);
+      if (old && --old.count === 0) {
+        if (old.changed && outline.anchor.style.getPropertyValue('position') === 'relative'
+          && (outline.anchor.style.getPropertyPriority?.('position') ?? 'important') === 'important') {
+          if (old.position) outline.anchor.style.setProperty('position', old.position, old.priority);
+          else outline.anchor.style.removeProperty('position');
+        }
+        messageOutlineAnchors.delete(outline.anchor);
+      }
+    }
+    outline.anchor = anchor;
+    if (!anchor) return;
+    let record = messageOutlineAnchors.get(anchor);
+    if (!record) {
+      const changed = window.getComputedStyle(anchor).position === 'static';
+      record = {
+        count: 0,
+        changed,
+        position: anchor.style.getPropertyValue('position'),
+        priority: anchor.style.getPropertyPriority?.('position') || '',
+      };
+      if (changed) anchor.style.setProperty('position', 'relative', 'important');
+      messageOutlineAnchors.set(anchor, record);
+    }
+    record.count += 1;
+    anchor.appendChild(outline.element);
+  }
+
+  function getMessageOutlineAnchor(node) {
+    for (let element = node.parentElement; element; element = element.parentElement) {
+      if (element !== document.body && window.getComputedStyle(element).display === 'contents') continue;
+      const rect = element.getBoundingClientRect();
+      if ((rect.width > 1 && rect.height > 1) || element === document.body) return element;
+    }
+    return document.body;
+  }
+
+  function ensureMessageOutlineTracking() {
+    if (outlineTrackingBound) return;
+    window.addEventListener('resize', scheduleMessageOutlineUpdate);
+    outlineTrackingBound = true;
+  }
+
+  function scheduleMessageOutlineUpdate() {
+    if (outlineUpdateQueued) return;
+    outlineUpdateQueued = true;
+    window.requestAnimationFrame(() => {
+      outlineUpdateQueued = false;
+      if (highlightedMessageOutline) positionMessageOutline(highlightedMessageOutline);
+      if (hoveredMessageOutline) positionMessageOutline(hoveredMessageOutline);
+      for (const outline of selectedMessageOutlines.values()) positionMessageOutline(outline);
+    });
+  }
+
+  function getMessageOutlineRect(node) {
+    if (!node?.isConnected) return null;
+    const own = node.getBoundingClientRect();
+    let left = own.width > 1 && own.height > 1 ? own.left : Infinity;
+    let top = own.width > 1 && own.height > 1 ? own.top : Infinity;
+    let right = own.width > 1 && own.height > 1 ? own.right : -Infinity;
+    let bottom = own.width > 1 && own.height > 1 ? own.bottom : -Infinity;
+    for (const element of node.querySelectorAll('div, p, span, li, pre, blockquote, article, section, h1, h2, h3, h4, h5, h6, ul, ol, table, mjx-container, math')) {
+      if (element.closest('button, [role="button"], #cgh-panel, #cgh-toast, .cgh-message-outline')) continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 1 || rect.height <= 1) continue;
+      left = Math.min(left, rect.left);
+      top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right);
+      bottom = Math.max(bottom, rect.bottom);
+    }
+    if (Number.isFinite(left)) return { left, top, right, bottom };
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rect = range.getBoundingClientRect();
+      return rect.width > 1 && rect.height > 1 ? rect : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function positionMessageOutline(outline) {
+    const rect = getMessageOutlineRect(outline.node);
+    if (!rect || rect.right - rect.left < 4 || rect.bottom - rect.top < 4) {
+      outline.element.hidden = true;
+      outline.element.remove();
+      setMessageOutlineAnchor(outline, null);
+      return;
+    }
+    const anchor = getMessageOutlineAnchor(outline.node);
+    setMessageOutlineAnchor(outline, anchor);
+    if (!outline.element.isConnected) anchor.appendChild(outline.element);
+    const anchorRect = anchor.getBoundingClientRect();
+    outline.element.style.left = `${rect.left - anchorRect.left - anchor.clientLeft + anchor.scrollLeft - 5}px`;
+    outline.element.style.top = `${rect.top - anchorRect.top - anchor.clientTop + anchor.scrollTop - 5}px`;
+    outline.element.style.width = `${rect.right - rect.left + 10}px`;
+    outline.element.style.height = `${rect.bottom - rect.top + 10}px`;
+    outline.element.hidden = false;
+  }
+
+  function setReadingStyle(element, property, value) {
+    let original = readingStyleBackup.get(element);
+    if (!original) {
+      original = new Map();
+      readingStyleBackup.set(element, original);
+    }
+    if (!original.has(property)) {
+      original.set(property, {
+        value: element.style.getPropertyValue(property),
+        priority: element.style.getPropertyPriority?.(property) || '',
+      });
+    }
+    if (element.style.getPropertyValue(property) !== value || element.style.getPropertyPriority?.(property) !== 'important') {
+      element.style.setProperty(property, value, 'important');
+    }
+  }
+
+  function restoreReadingStyles() {
+    for (const [element, properties] of readingStyleBackup) {
+      for (const [property, original] of properties) {
+        if (original.value) element.style.setProperty(property, original.value, original.priority);
+        else element.style.removeProperty(property);
+      }
+    }
+    readingStyleBackup.clear();
+    readingBaseFontSizes = new WeakMap();
+  }
+
+  function getReadingBaseFontSize(element) {
+    let size = readingBaseFontSizes.get(element);
+    if (size) return size;
+    const computed = document.defaultView?.getComputedStyle?.(element);
+    size = Number.parseFloat(computed?.fontSize || element.style.getPropertyValue('font-size'));
+    if (!Number.isFinite(size) || size < 8 || size > 96) size = 16;
+    readingBaseFontSizes.set(element, size);
+    return size;
+  }
+
+  function isReadingTextElement(element) {
+    if (element.closest('button, [role="button"], form, nav, aside, header, footer, pre, code, svg, .katex, mjx-container, math, .sr-only, [aria-hidden="true"], [hidden], #cgh-panel, #cgh-toast')) return false;
+    return [...element.childNodes].some(child => child.nodeType === 3 && child.textContent.trim());
+  }
+
   function applyReadingSettings() {
-    document.documentElement.classList.toggle('cgh-reading-enabled', settings.readingEnabled);
-    document.documentElement.style.setProperty('--cgh-reading-width', `${settings.readingWidth}px`);
-    document.documentElement.style.setProperty('--cgh-font-scale', String(settings.fontScale / 100));
-    document.documentElement.style.setProperty('--cgh-line-height', String(settings.lineHeight));
-    document.documentElement.style.setProperty('--cgh-paragraph-spacing', `${settings.paragraphSpacing}em`);
+    document.documentElement.classList.remove('cgh-reading-enabled');
+    if (!settings.readingEnabled) {
+      restoreReadingStyles();
+      return { readingTargets: 0, widthTargets: 0, readingVerified: true, diagnostics: null };
+    }
+
+    for (const element of readingStyleBackup.keys()) {
+      if (!element.isConnected) readingStyleBackup.delete(element);
+    }
+
+    const lineHeight = String(settings.lineHeight);
+    const spacing = `${settings.paragraphSpacing}em`;
+    const width = `${settings.readingWidth}px`;
+    const sectionTurns = [...document.querySelectorAll('section[data-turn="user"], section[data-turn="assistant"]')];
+    const roleNodes = [...document.querySelectorAll('[data-message-author-role]')];
+    const messageIds = [...document.querySelectorAll('[data-message-id]')];
+    const legacyTurns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
+    const actionNodes = findMessageNodesFromActions();
+    const main = document.querySelector('main');
+    const route = /(?:^|\/)c\/[^/]+/.test(location.pathname) ? 'conversation' : location.pathname === '/' ? 'home' : 'other';
+    const selectContent = node => node.querySelector('.markdown, .prose, [class*="markdown"]') || node;
+    let source = 'section[data-turn]';
+    let contentNodes = sectionTurns.filter(node => node.textContent.trim()).map(selectContent);
+    if (!contentNodes.length) {
+      source = '[data-message-author-role]';
+      contentNodes = roleNodes.filter(node => node.textContent.trim()).map(selectContent);
+    }
+    if (!contentNodes.length) {
+      source = 'conversation-turn';
+      contentNodes = legacyTurns.filter(node => node.textContent.trim()).map(selectContent);
+    }
+    if (!contentNodes.length) {
+      source = 'data-message-id';
+      contentNodes = messageIds.filter(node => node.textContent.trim()).map(selectContent);
+    }
+    if (!contentNodes.length) {
+      source = 'copy actions';
+      const extraTextNodes = findGenericMessageNodes().filter(node => !actionNodes.some(action => action.contains(node)));
+      contentNodes = dedupeNodes([...actionNodes, ...extraTextNodes]).filter(node => node.textContent.trim());
+      if (!actionNodes.length) source = 'main text';
+      else if (extraTextNodes.length) source = 'copy actions + main text';
+    }
+    if (!contentNodes.length) {
+      source = 'main markdown';
+      contentNodes = [...document.querySelectorAll('main .markdown, main .prose')]
+        .filter(node => node.textContent.trim() && !node.closest('#cgh-panel'));
+    }
+    if (!contentNodes.length) {
+      source = 'main text';
+      contentNodes = findGenericMessageNodes();
+    }
+    if (!contentNodes.length) source = 'none';
+
+    const textNodes = new Set();
+    const fontNodes = new Set(roleNodes);
+    const lineNodes = new Set(roleNodes);
+    const spacingNodes = new Set();
+    const blockSelector = 'p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, pre, table, .katex-display, mjx-container[display="true"]';
+    for (const content of contentNodes) {
+      fontNodes.add(content);
+      lineNodes.add(content);
+      if (content.matches(blockSelector)) spacingNodes.add(content);
+      const descendants = content.querySelectorAll('p, li, blockquote, h1, h2, h3, h4, h5, h6, div, span, pre, code, .katex, mjx-container, math');
+      for (const element of descendants) {
+        if (isReadingTextElement(element)) {
+          textNodes.add(element);
+          fontNodes.add(element);
+          lineNodes.add(element);
+        }
+        if (element.matches('pre, code, .katex, mjx-container, math')
+          && !element.closest('button, form, nav, aside, header, footer, #cgh-panel, #cgh-toast')
+          && !element.parentElement?.closest('pre, code, .katex, mjx-container, math')) {
+          fontNodes.add(element);
+        }
+        if (element.matches(blockSelector)
+          && !element.closest('button, form, nav, aside, header, footer, #cgh-panel, #cgh-toast')) spacingNodes.add(element);
+      }
+      if (isReadingTextElement(content)) textNodes.add(content);
+    }
+    for (const element of textNodes) {
+      if (element.matches('div') && !element.closest(blockSelector)
+        && ['block', 'flow-root', 'flex', 'grid'].includes(document.defaultView?.getComputedStyle?.(element)?.display)) {
+        spacingNodes.add(element);
+      }
+    }
+    const baseSizes = new Map([...fontNodes].map(element => [element, getReadingBaseFontSize(element)]));
+    for (const [element, base] of baseSizes) {
+      setReadingStyle(element, 'font-size', `${Math.round(base * settings.fontScale) / 100}px`);
+    }
+    for (const element of lineNodes) setReadingStyle(element, 'line-height', lineHeight);
+    for (const element of spacingNodes) setReadingStyle(element, 'margin-block', spacing);
+
+    const widthNodes = new Set(document.querySelectorAll('main #thread [class*="thread-content-max-width"], main [data-testid^="conversation-turn-"] [class*="thread-content-max-width"]'));
+    for (const content of contentNodes) {
+      if (content.closest('section[data-turn="user"], [data-message-author-role="user"]')) continue;
+      const boundary = content.closest('main') || document.body;
+      for (let node = content.parentElement; node && node !== boundary; node = node.parentElement) {
+        if (typeof node.className === 'string' && node.className.includes('max-w-') && !node.className.includes('user-chat-width')) {
+          widthNodes.add(node);
+        }
+      }
+    }
+    if (!widthNodes.size && document.defaultView?.getComputedStyle) {
+      for (const content of contentNodes.slice(0, 5)) {
+        for (let node = content.parentElement; node && node !== main && node !== document.body; node = node.parentElement) {
+          const maxWidth = document.defaultView.getComputedStyle(node).maxWidth;
+          if (/^\d+(?:\.\d+)?px$/.test(maxWidth) && Number.parseFloat(maxWidth) >= 400 && Number.parseFloat(maxWidth) <= 2000) {
+            widthNodes.add(node);
+          }
+        }
+      }
+    }
+    for (const node of widthNodes) {
+      setReadingStyle(node, '--thread-content-max-width', width);
+      setReadingStyle(node, 'max-width', width);
+      setReadingStyle(node, 'width', '100%');
+    }
+    const sample = [...textNodes].find(node => {
+      const rect = node.getBoundingClientRect?.();
+      const viewportHeight = document.defaultView?.innerHeight;
+      return rect && rect.width > 0 && rect.height > 0 && rect.bottom > 0 && (!viewportHeight || rect.top < viewportHeight);
+    }) || [...textNodes][0] || contentNodes[0];
+    const computedFontSize = sample && document.defaultView?.getComputedStyle
+      ? parseFloat(document.defaultView.getComputedStyle(sample).fontSize)
+      : parseFloat(sample?.style.getPropertyValue('font-size'));
+    const expectedFontSize = sample ? getReadingBaseFontSize(sample) * settings.fontScale / 100 : NaN;
+    const computedLineHeight = sample
+      ? document.defaultView?.getComputedStyle?.(sample)?.lineHeight || sample.style.getPropertyValue('line-height')
+      : null;
+    const spacingSample = [...spacingNodes][0];
+    const computedSpacing = spacingSample
+      ? document.defaultView?.getComputedStyle?.(spacingSample)?.marginBlockStart || spacingSample.style.getPropertyValue('margin-block')
+      : null;
+    return {
+      readingTargets: contentNodes.length,
+      widthTargets: widthNodes.size,
+      readingVerified: Number.isFinite(computedFontSize) && Math.abs(computedFontSize - expectedFontSize) < 0.5,
+      diagnostics: {
+        source,
+        route,
+        main: Number(Boolean(main)),
+        paragraphs: main?.querySelectorAll('p').length || 0,
+        autoDirs: main?.querySelectorAll('[dir="auto"]').length || 0,
+        mainChars: main?.textContent?.trim().length || 0,
+        frames: document.querySelectorAll('iframe').length,
+        sections: sectionTurns.length,
+        roles: roleNodes.length,
+        messageIds: messageIds.length,
+        actions: actionNodes.length,
+        legacyTurns: legacyTurns.length,
+        markdown: document.querySelectorAll('main .markdown, main .prose').length,
+        textTargets: textNodes.size,
+        spacingTargets: spacingNodes.size,
+        baseFontSize: Number.isFinite(expectedFontSize) ? getReadingBaseFontSize(sample) : null,
+        fontSize: Number.isFinite(computedFontSize) ? computedFontSize : null,
+        lineHeight: computedLineHeight || null,
+        marginBlock: computedSpacing || null,
+      },
+    };
   }
 
   function findComposer() {
