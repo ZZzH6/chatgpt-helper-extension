@@ -15,10 +15,16 @@ function createPopup({ sendMessage, query = async () => [{ id: 7, url: 'https://
       this.type = typeof value === 'boolean' ? 'checkbox' : 'range';
       this.checked = value === true;
       this.value = String(value);
+      this.min = ({ readingWidth: '620', fontScale: '80', lineHeight: '1.3', paragraphSpacing: '0.1' })[id] || '';
     }
   }
 
   const fields = Object.fromEntries(Object.entries(toolkit.DEFAULTS).map(([id, value]) => [id, new MockInput(id, value)]));
+  const outputs = Object.fromEntries(['readingWidth', 'fontScale', 'lineHeight', 'paragraphSpacing'].map(id => [id, {
+    value: '',
+    classes: new Set(),
+    classList: { toggle(name, force) { force ? outputs[id].classes.add(name) : outputs[id].classes.delete(name); } },
+  }]));
   const status = { textContent: '' };
   const diagnostics = { textContent: '', hidden: true };
   const saveButton = { disabled: false, addEventListener: (_type, listener) => { saveButton.click = listener; } };
@@ -26,7 +32,10 @@ function createPopup({ sendMessage, query = async () => [{ id: 7, url: 'https://
   const document = {
     getElementById: id => ({ ...fields, status, diagnostics, saveBtn: saveButton, extensionVersion: { textContent: '' } })[id],
     querySelectorAll: () => [],
-    querySelector: () => null,
+    querySelector: selector => {
+      const id = selector.match(/data-for="([^"]+)"/)?.[1];
+      return id ? outputs[id] : null;
+    },
   };
   const chrome = {
     runtime: { getManifest: () => ({ version: '2.0.12' }) },
@@ -44,11 +53,26 @@ function createPopup({ sendMessage, query = async () => [{ id: 7, url: 'https://
     },
   };
   vm.runInNewContext(popupCode, { document, chrome, globalThis: { CGH_TOOLKIT: toolkit }, HTMLInputElement: MockInput, URL });
-  return { fields, status, diagnostics, saveButton, calls };
+  return { fields, outputs, status, diagnostics, saveButton, calls };
 }
 
+test('popup marks original slider values and saves them as zero', async () => {
+  const popup = createPopup({ sendMessage: async () => ({ applied: true, readingEngineVersion: 7, navigationTargets: 3, readingTargets: 3, widthTargets: 3, readingVerified: true, diagnostics }) });
+  await popup.saveButton.click();
+  for (const id of ['readingWidth', 'fontScale', 'lineHeight', 'paragraphSpacing']) {
+    assert.equal(popup.outputs[id].value, '原版');
+    assert.equal(popup.outputs[id].classes.has('range-output-original'), true);
+    assert.equal(Number(popup.fields[id].value), Number(popup.fields[id].min));
+  }
+
+  assert.deepEqual(
+    [popup.calls.saved.readingWidth, popup.calls.saved.fontScale, popup.calls.saved.lineHeight, popup.calls.saved.paragraphSpacing],
+    [0, 0, 0, 0],
+  );
+});
+
 test('saving applies changed settings to the open ChatGPT tab without reloading', async () => {
-  const popup = createPopup({ sendMessage: async () => ({ applied: true, readingEngineVersion: 6, navigationTargets: 3, readingTargets: 3, widthTargets: 3, readingVerified: true, diagnostics }) });
+  const popup = createPopup({ sendMessage: async () => ({ applied: true, readingEngineVersion: 7, navigationTargets: 3, readingTargets: 3, widthTargets: 3, readingVerified: true, diagnostics }) });
   popup.fields.readingEnabled.checked = true;
   popup.fields.readingWidth.value = '1000';
 
@@ -80,7 +104,7 @@ test('saving refreshes a tab still running the older content script', async () =
 
 test('saving reports when the active tab is not ChatGPT', async () => {
   const popup = createPopup({
-    sendMessage: async () => ({ applied: true, readingEngineVersion: 6, navigationTargets: 3, readingTargets: 3, widthTargets: 3, readingVerified: true, diagnostics }),
+    sendMessage: async () => ({ applied: true, readingEngineVersion: 7, navigationTargets: 3, readingTargets: 3, widthTargets: 3, readingVerified: true, diagnostics }),
     query: async () => [{ id: 8, url: 'https://example.com/' }],
   });
 
@@ -94,7 +118,7 @@ test('saving reports when the active tab is not ChatGPT', async () => {
 
 test('saving reports a chat page with no recognized reading content', async () => {
   const popup = createPopup({ sendMessage: async () => ({
-    applied: true, readingEngineVersion: 6, navigationTargets: 0, readingTargets: 0, widthTargets: 0, readingVerified: false,
+    applied: true, readingEngineVersion: 7, navigationTargets: 0, readingTargets: 0, widthTargets: 0, readingVerified: false,
     diagnostics: { ...diagnostics, source: 'none', sections: 0, roles: 0, legacyTurns: 0, markdown: 0, fontSize: null },
   }) });
   popup.fields.readingEnabled.checked = true;
@@ -108,7 +132,7 @@ test('saving reports a chat page with no recognized reading content', async () =
 });
 
 test('saving reports when message styles are not visibly applied', async () => {
-  const popup = createPopup({ sendMessage: async () => ({ applied: true, readingEngineVersion: 6, navigationTargets: 2, readingTargets: 2, widthTargets: 2, readingVerified: false, diagnostics }) });
+  const popup = createPopup({ sendMessage: async () => ({ applied: true, readingEngineVersion: 7, navigationTargets: 2, readingTargets: 2, widthTargets: 2, readingVerified: false, diagnostics }) });
   popup.fields.readingEnabled.checked = true;
 
   await popup.saveButton.click();
@@ -116,21 +140,21 @@ test('saving reports when message styles are not visibly applied', async () => {
   assert.equal(popup.status.textContent, '已保存，但排版未生效');
 });
 
-test('saving reports when conversation navigation still has no messages', async () => {
+test('saving reports when no conversation messages are recognized', async () => {
   const popup = createPopup({ sendMessage: async () => ({
-    applied: true, readingEngineVersion: 6, navigationTargets: 0, readingTargets: 2, widthTargets: 1, readingVerified: true, diagnostics,
+    applied: true, readingEngineVersion: 7, navigationTargets: 0, readingTargets: 2, widthTargets: 1, readingVerified: true, diagnostics,
   }) });
   popup.fields.readingEnabled.checked = true;
 
   await popup.saveButton.click();
 
-  assert.match(popup.status.textContent, /对话导航未找到消息/);
-  assert.match(popup.diagnostics.textContent, /导航 0/);
+  assert.match(popup.status.textContent, /未识别到对话消息/);
+  assert.match(popup.diagnostics.textContent, /消息识别 0/);
 });
 
 test('saving identifies a ChatGPT page without an open conversation', async () => {
   const popup = createPopup({ sendMessage: async () => ({
-    applied: true, readingEngineVersion: 6, navigationTargets: 0, readingTargets: 0, widthTargets: 0, readingVerified: false,
+    applied: true, readingEngineVersion: 7, navigationTargets: 0, readingTargets: 0, widthTargets: 0, readingVerified: false,
     diagnostics: { ...diagnostics, route: 'home', source: 'none', mainChars: 40, paragraphs: 0 },
   }) });
   popup.fields.readingEnabled.checked = true;

@@ -12,7 +12,14 @@ function updateRangeOutput(id) {
   const field = getField(id);
   const output = document.querySelector(`output[data-for="${id}"]`);
   if (!field || !output) return;
-  const suffix = id === 'readingWidth' ? 'px' : id === 'fontScale' ? '%' : '';
+  const value = Number(field.value);
+  const isOriginal = value === Number(field.min);
+  output.classList.toggle('range-output-original', isOriginal);
+  if (isOriginal) {
+    output.value = '原版';
+    return;
+  }
+  const suffix = id === 'readingWidth' ? 'px' : id === 'fontScale' ? '%' : id === 'lineHeight' ? '倍' : 'em';
   output.value = `${field.value}${suffix}`;
 }
 
@@ -24,7 +31,7 @@ function renderSettings(values) {
     if (field instanceof HTMLInputElement && field.type === 'checkbox') {
       field.checked = settings[id];
     } else {
-      field.value = settings[id];
+      field.value = settings[id] === 0 ? field.min : settings[id];
     }
   }
   ['readingWidth', 'fontScale', 'lineHeight', 'paragraphSpacing'].forEach(updateRangeOutput);
@@ -37,7 +44,7 @@ function readSettings() {
     if (!field) continue;
     values[id] = field instanceof HTMLInputElement && field.type === 'checkbox'
       ? field.checked
-      : field.value;
+      : Number(field.value) === Number(field.min) ? 0 : field.value;
   }
   return normalizeSettings(values);
 }
@@ -85,7 +92,7 @@ async function saveSettings() {
 
     try {
       const response = await chrome.tabs.sendMessage(tab.id, { type: 'cgh:apply-settings', settings });
-      if (!response?.applied || response.readingEngineVersion !== 6 || !Number.isInteger(response.readingTargets)
+      if (!response?.applied || response.readingEngineVersion !== 7 || !Number.isInteger(response.readingTargets)
         || !Number.isInteger(response.navigationTargets)
         || (settings.readingEnabled && typeof response.diagnostics?.route !== 'string')) {
         throw new Error('Content script did not confirm settings');
@@ -93,7 +100,7 @@ async function saveSettings() {
       if (settings.readingEnabled && response.diagnostics) {
         const info = response.diagnostics;
         diagnostics.textContent = `页面 ${info.route} · main文字 ${info.mainChars} · 段落 ${info.paragraphs} · iframe ${info.frames}\n定位 ${info.source} · section ${info.sections} · role ${info.roles} · turn ${info.legacyTurns} · markdown ${info.markdown} · width ${response.widthTargets}`;
-        diagnostics.textContent += `\n导航 ${response.navigationTargets} (${response.navigationSource}) · message-id ${info.messageIds} · 操作锚点 ${info.actions}`;
+        diagnostics.textContent += `\n消息识别 ${response.navigationTargets} (${response.navigationSource}) · message-id ${info.messageIds} · 操作锚点 ${info.actions}`;
         diagnostics.textContent += `\n文字 ${info.textTargets} · 段距 ${info.spacingTargets} · 原字号 ${info.baseFontSize ?? '-'}→${info.fontSize ?? '-'}px · 行高 ${info.lineHeight ?? '-'} · 段距 ${info.marginBlock ?? '-'}`;
         diagnostics.hidden = false;
       }
@@ -106,7 +113,7 @@ async function saveSettings() {
       } else if (settings.readingEnabled && response.widthTargets === 0) {
         status.textContent = '已保存，宽度容器未识别';
       } else if (response.navigationTargets === 0 && /(?:^|\/)c\/[^/]+/.test(new URL(tab.url).pathname)) {
-        status.textContent = '已保存，但对话导航未找到消息';
+        status.textContent = '已保存，但未识别到对话消息';
       } else {
         status.textContent = '已保存，聊天页已更新';
       }

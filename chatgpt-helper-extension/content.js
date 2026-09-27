@@ -6,7 +6,6 @@
 
   let settings = { ...DEFAULTS };
   let panel = null;
-  let listContainer = null;
   let toastEl = null;
   let updateTimer = null;
   let observer = null;
@@ -17,27 +16,16 @@
   let formulaListenersBound = false;
   let currentMessages = [];
   let navigationSource = 'none';
-  let highlightedMessageNode = null;
-  let highlightedMessageTimer = null;
-  let highlightedMessageOutline = null;
   let hoveredMessageOutline = null;
   const selectedMessageOutlines = new Map();
   const messageOutlineAnchors = new WeakMap();
   let outlineTrackingBound = false;
   let outlineUpdateQueued = false;
-  let lastConversationMutationAt = performance.now();
-  let jumpSequence = 0;
-  let jumpRunning = false;
-  let pendingJump = null;
   let exportSelectionMode = false;
   let exportRendering = false;
   let activeExportFormat = null;
   let exportClickListenerBound = false;
   let activeConversationKey = getConversationKey();
-  let timelineQuery = '';
-  let starredOnly = false;
-  let activeTimelineIndex = -1;
-  let starredSignatures = new Set();
   let draftInput = null;
   let draftSaveTimer = null;
   let draftObserver = null;
@@ -45,14 +33,6 @@
   let readingBaseFontSizes = new WeakMap();
   const inferredMessageRoles = new WeakMap();
   const selectedMessageSignatures = new Set();
-  const CONVERSATION_READY_QUIET_MS = 500;
-  const PRE_JUMP_SCROLL_IDLE_MS = 260;
-  const PRE_JUMP_SCROLL_IDLE_TIMEOUT_MS = 2200;
-  const AUTO_FOLLOW_ESCAPE_PX = 96;
-  const AUTO_FOLLOW_BOTTOM_THRESHOLD_PX = 80;
-  const SCROLL_SETTLE_QUIET_MS = 180;
-  const SCROLL_POSITION_EPSILON = 2;
-  const STAR_STORAGE_KEY = 'cghStarredMessages';
   const DRAFT_STORAGE_PREFIX = 'cghDraft:';
   const COMPOSER_SELECTORS = '#prompt-textarea, textarea[data-id="root"], textarea, div[contenteditable="true"].ProseMirror';
 
@@ -93,7 +73,6 @@
 
   async function init() {
     settings = normalizeSettings(await chrome.storage.sync.get(DEFAULTS));
-    await loadStarredMessages();
     createPanel();
     ensureFormulaUi();
     applyReadingSettings();
@@ -126,9 +105,8 @@
       const readingResult = applyReadingSettings();
       if (settings.draftSaveEnabled) attachDraftInput();
       currentMessages = collectMessages();
-      renderTimeline();
       updateExportUi();
-      sendResponse({ applied: true, readingEngineVersion: 6, navigationTargets: currentMessages.length, navigationSource, ...readingResult });
+      sendResponse({ applied: true, readingEngineVersion: 7, navigationTargets: currentMessages.length, navigationSource, ...readingResult });
     });
   }
 
@@ -149,10 +127,7 @@
     if (conversationKey === activeConversationKey) return;
     saveDraftNow();
     activeConversationKey = conversationKey;
-    timelineQuery = '';
-    activeTimelineIndex = -1;
     selectedMessageSignatures.clear();
-    void loadStarredMessages().then(() => renderTimeline());
     window.setTimeout(() => {
       attachDraftInput();
       void restoreDraft();
@@ -175,7 +150,6 @@
         }
       }
       if (shouldRefresh) scheduleRefresh();
-      if (shouldRefresh) lastConversationMutationAt = performance.now();
     });
     observer.observe(document.documentElement, {
       childList: true,
@@ -212,7 +186,6 @@
     const messages = collectMessages();
     currentMessages = messages;
     syncSelectedMessagesWithCurrent();
-    renderTimeline();
     updateExportUi();
     attachDraftInput();
   }
@@ -228,31 +201,18 @@
 
     panel = document.createElement('div');
     panel.id = 'cgh-panel';
-    panel.classList.add('cgh-hidden');
     panel.innerHTML = `
       <div class="cgh-header">
-        <div class="cgh-title">对话导航</div>
-        <div class="cgh-actions">
-          <button class="cgh-mini-btn" data-action="refresh" title="重新扫描当前页面的消息，不刷新网页">更新列表</button>
-          <button class="cgh-mini-btn" data-action="toggle">展开</button>
-        </div>
+        <div class="cgh-title">消息导出</div>
       </div>
-      <div class="cgh-timeline-tools">
-        <input id="cgh-search" type="search" placeholder="搜索当前对话" autocomplete="off" />
-        <button class="cgh-icon-btn" data-action="star-filter" type="button" title="仅显示星标" aria-label="仅显示星标" aria-pressed="false">★</button>
-      </div>
-      <div class="cgh-list" id="cgh-list"></div>
       <div class="cgh-export">
         <div class="cgh-export-buttons">
-          <button class="cgh-mini-btn" data-action="export-select">选择</button>
-          <button class="cgh-mini-btn" data-action="select-all">全选</button>
-          <button class="cgh-mini-btn" data-action="export-png" disabled>PNG</button>
-          <button class="cgh-mini-btn" data-action="export-pdf" disabled>PDF</button>
-          <button class="cgh-mini-btn" data-action="export-markdown" disabled>MD</button>
-          <button class="cgh-mini-btn" data-action="export-print-pdf" disabled>打印</button>
-          <button class="cgh-mini-btn" data-action="export-cancel" hidden>取消</button>
+          <button type="button" class="cgh-mini-btn cgh-select-btn" data-action="export-select" aria-pressed="false">选择消息</button>
+          <button type="button" class="cgh-mini-btn" data-action="export-png" disabled>PNG</button>
+          <button type="button" class="cgh-mini-btn" data-action="export-markdown" disabled>MD</button>
+          <button type="button" class="cgh-mini-btn" data-action="export-print-pdf" disabled>打印</button>
         </div>
-        <div class="cgh-export-status" id="cgh-export-status">未选择消息</div>
+        <div class="cgh-export-status" id="cgh-export-status" role="status" aria-live="polite">未选择消息</div>
       </div>
     `;
 
@@ -260,33 +220,11 @@
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
       const action = target.dataset.action;
-      if (action === 'refresh') {
-        refreshAll();
-        showToast(`已重新扫描，找到 ${currentMessages.length} 条消息`);
-      }
-      if (action === 'toggle') {
-        panel.classList.toggle('cgh-hidden');
-        target.textContent = panel.classList.contains('cgh-hidden') ? '展开' : '收起';
-      }
-      if (action === 'star-filter') {
-        starredOnly = !starredOnly;
-        target.setAttribute('aria-pressed', String(starredOnly));
-        renderTimeline();
-      }
       if (action === 'export-select') {
-        setExportSelectionMode(true);
-      }
-      if (action === 'select-all') {
-        const shouldSelect = selectedMessageSignatures.size !== currentMessages.length;
-        selectedMessageSignatures.clear();
-        if (shouldSelect) currentMessages.forEach(message => selectedMessageSignatures.add(message.signature));
-        updateExportUi();
+        setExportSelectionMode(!exportSelectionMode, exportSelectionMode ? { clearSelection: true } : {});
       }
       if (action === 'export-png') {
         void exportSelectedMessages('png');
-      }
-      if (action === 'export-pdf') {
-        void exportSelectedMessages('pdf');
       }
       if (action === 'export-markdown') {
         void exportSelectedMessages('markdown');
@@ -294,18 +232,9 @@
       if (action === 'export-print-pdf') {
         void exportSelectedMessages('print-pdf');
       }
-      if (action === 'export-cancel') {
-        setExportSelectionMode(false, { clearSelection: true });
-      }
     });
 
     document.body.appendChild(panel);
-    listContainer = panel.querySelector('#cgh-list');
-    listContainer.addEventListener('click', handleMessageListClick);
-    panel.querySelector('#cgh-search').addEventListener('input', (event) => {
-      timelineQuery = event.target.value;
-      renderTimeline();
-    });
     ensureExportSelectionListener();
   }
 
@@ -483,75 +412,6 @@ ${text}\n\
       .trim();
   }
 
-  function renderTimeline() {
-    if (!listContainer) return;
-    const items = currentMessages
-      .map((message, index) => ({ message, index }))
-      .filter(({ message }) => TOOLKIT.matchesTimelineQuery(message, timelineQuery))
-      .filter(({ message }) => !starredOnly || starredSignatures.has(message.signature));
-
-    listContainer.innerHTML = items.map(({ message, index }) => {
-      const starred = starredSignatures.has(message.signature);
-      const selected = selectedMessageSignatures.has(message.signature);
-      const preview = message.text.slice(0, 96).replace(/\s+/g, ' ');
-      return `
-        <div class="cgh-item${selected ? ' cgh-item-selected' : ''}${index === activeTimelineIndex ? ' cgh-item-active' : ''}" data-message-index="${index}">
-          <button type="button" class="cgh-star-btn${starred ? ' cgh-starred' : ''}" data-action="toggle-star" title="${starred ? '取消星标' : '添加星标'}" aria-label="${starred ? '取消星标' : '添加星标'}" aria-pressed="${starred}">★</button>
-          <button type="button" class="cgh-jump-btn" data-action="jump-message" aria-label="跳转到第 ${index + 1} 条消息">
-            <span class="cgh-role">${message.role === 'user' ? '你' : message.role === 'assistant' ? 'GPT' : '内容'}</span>
-            <span class="cgh-preview">${escapeHtml(`${index + 1}. ${preview}`)}</span>
-          </button>
-        </div>`;
-    }).join('') || '<div class="cgh-empty">没有匹配的消息</div>';
-  }
-
-  async function loadStarredMessages() {
-    const data = await chrome.storage.local.get(STAR_STORAGE_KEY);
-    const allStars = data[STAR_STORAGE_KEY] || {};
-    starredSignatures = new Set(Array.isArray(allStars[activeConversationKey]) ? allStars[activeConversationKey] : []);
-  }
-
-  async function saveStarredMessages() {
-    const data = await chrome.storage.local.get(STAR_STORAGE_KEY);
-    const allStars = data[STAR_STORAGE_KEY] && typeof data[STAR_STORAGE_KEY] === 'object'
-      ? data[STAR_STORAGE_KEY]
-      : {};
-    if (starredSignatures.size) allStars[activeConversationKey] = [...starredSignatures];
-    else delete allStars[activeConversationKey];
-    await chrome.storage.local.set({ [STAR_STORAGE_KEY]: allStars });
-  }
-
-  function handleMessageListClick(event) {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-
-    const item = target.closest('.cgh-item');
-    if (!(item instanceof HTMLElement) || !listContainer?.contains(item)) return;
-
-    const index = Number(item.dataset.messageIndex);
-    if (!Number.isInteger(index)) return;
-
-    event.preventDefault();
-    event.stopPropagation();
-    if (target.closest('[data-action="toggle-star"]')) {
-      const message = currentMessages[index];
-      if (!message) return;
-      if (starredSignatures.has(message.signature)) starredSignatures.delete(message.signature);
-      else starredSignatures.add(message.signature);
-      void saveStarredMessages();
-      renderTimeline();
-      return;
-    }
-    if (exportSelectionMode) {
-      toggleMessageSelection(index);
-      return;
-    }
-
-    activeTimelineIndex = index;
-    queueMessageJump(index);
-    renderTimeline();
-  }
-
   function ensureExportSelectionListener() {
     if (exportClickListenerBound) return;
     document.addEventListener('click', handleExportSelectionClick, true);
@@ -605,6 +465,12 @@ ${text}\n\
   }
 
   function setExportSelectionMode(enabled, options = {}) {
+    if (enabled) {
+      syncConversationState();
+      currentMessages = collectMessages();
+      syncSelectedMessagesWithCurrent();
+    }
+
     exportSelectionMode = enabled;
     document.documentElement.classList.toggle('cgh-export-mode', exportSelectionMode);
     if (!enabled) clearHoveredMessageOutline();
@@ -648,34 +514,23 @@ ${text}\n\
 
   function updateExportUi() {
     updateSelectedMessageClasses();
-    updateMessageListSelectionState();
 
     if (!panel) return;
-    panel.classList.toggle('cgh-exporting', exportSelectionMode);
 
     const selectBtn = panel.querySelector('[data-action="export-select"]');
     const exportPngBtn = panel.querySelector('[data-action="export-png"]');
-    const exportPdfBtn = panel.querySelector('[data-action="export-pdf"]');
     const exportMarkdownBtn = panel.querySelector('[data-action="export-markdown"]');
     const exportPrintPdfBtn = panel.querySelector('[data-action="export-print-pdf"]');
-    const selectAllBtn = panel.querySelector('[data-action="select-all"]');
-    const cancelBtn = panel.querySelector('[data-action="export-cancel"]');
     const statusEl = panel.querySelector('#cgh-export-status');
     const selectedCount = selectedMessageSignatures.size;
 
     if (selectBtn instanceof HTMLButtonElement) {
-      selectBtn.textContent = exportSelectionMode ? '选择中' : '选择';
-    }
-    if (selectAllBtn instanceof HTMLButtonElement) {
-      selectAllBtn.textContent = currentMessages.length > 0 && selectedCount === currentMessages.length ? '清空' : '全选';
+      selectBtn.textContent = exportSelectionMode ? '取消选择' : '选择消息';
+      selectBtn.setAttribute('aria-pressed', exportSelectionMode ? 'true' : 'false');
     }
     if (exportPngBtn instanceof HTMLButtonElement) {
       exportPngBtn.disabled = selectedCount === 0 || exportRendering;
       exportPngBtn.textContent = exportRendering && activeExportFormat === 'png' ? '处理中' : 'PNG';
-    }
-    if (exportPdfBtn instanceof HTMLButtonElement) {
-      exportPdfBtn.disabled = selectedCount === 0 || exportRendering;
-      exportPdfBtn.textContent = exportRendering && activeExportFormat === 'pdf' ? '处理中' : 'PDF';
     }
     if (exportMarkdownBtn instanceof HTMLButtonElement) {
       exportMarkdownBtn.disabled = selectedCount === 0 || exportRendering;
@@ -685,11 +540,8 @@ ${text}\n\
       exportPrintPdfBtn.disabled = selectedCount === 0 || exportRendering;
       exportPrintPdfBtn.textContent = exportRendering && activeExportFormat === 'print-pdf' ? '准备中' : '打印';
     }
-    if (cancelBtn instanceof HTMLButtonElement) {
-      cancelBtn.hidden = !exportSelectionMode && selectedCount === 0;
-    }
     if (statusEl) {
-      statusEl.textContent = selectedCount ? `已选择 ${selectedCount} 条消息` : (exportSelectionMode ? '点击消息选择导出内容' : '未选择消息');
+      statusEl.textContent = selectedCount ? `已选择 ${selectedCount} 条` : (exportSelectionMode ? '请在聊天正文中点选消息' : '未选择消息');
     }
   }
 
@@ -719,22 +571,9 @@ ${text}\n\
     scheduleMessageOutlineUpdate();
   }
 
-  function updateMessageListSelectionState() {
-    if (!listContainer) return;
-    listContainer.querySelectorAll('.cgh-item').forEach((item) => {
-      if (!(item instanceof HTMLElement)) return;
-      const index = Number(item.dataset.messageIndex);
-      const message = currentMessages[index];
-      const selected = !!message && selectedMessageSignatures.has(message.signature);
-      item.classList.toggle('cgh-item-selected', selected);
-      item.setAttribute('aria-pressed', selected ? 'true' : 'false');
-    });
-    renderTimeline();
-  }
-
   async function exportSelectedMessages(format = 'png') {
     if (exportRendering) return;
-    const exportFormat = ['pdf', 'print-pdf', 'markdown'].includes(format) ? format : 'png';
+    const exportFormat = ['print-pdf', 'markdown'].includes(format) ? format : 'png';
     const exportLabel = exportFormat === 'print-pdf' ? '打印 PDF' : exportFormat.toUpperCase();
 
     currentMessages = collectMessages();
@@ -782,18 +621,11 @@ ${text}\n\
         usedFallback = true;
       }
 
-      if (exportFormat === 'pdf') {
-        const pdfBlob = await buildPdfFromPngParts(dataUrls);
-        downloadBlob(pdfBlob, buildExportFilename(0, 1, 'pdf'));
-      } else {
-        dataUrls.forEach((dataUrl, index) => {
-          downloadDataUrl(dataUrl, buildExportFilename(index, dataUrls.length));
-        });
-      }
+      dataUrls.forEach((dataUrl, index) => {
+        downloadDataUrl(dataUrl, buildExportFilename(index, dataUrls.length));
+      });
 
-      const partText = exportFormat === 'pdf'
-        ? (dataUrls.length > 1 ? `（${dataUrls.length} 页）` : '')
-        : (dataUrls.length > 1 ? `（${dataUrls.length} 张）` : '');
+      const partText = dataUrls.length > 1 ? `（${dataUrls.length} 张）` : '';
       showToast(`已导出 ${selectedMessages.length} 条消息${partText}${usedFallback ? '（兼容模式）' : ''}`);
     } catch (error) {
       console.error(`[CGH] Failed to export ${exportLabel}`, error);
@@ -1176,7 +1008,7 @@ ${text}\n\
         min-width: 0 !important;
       }
 
-      .cgh-print-content * {
+      .cgh-print-content *:not(.katex):not(.katex *) {
         max-width: 100% !important;
         min-width: 0 !important;
         overflow: visible !important;
@@ -1399,9 +1231,17 @@ ${text}\n\
         page-break-inside: avoid;
       }
 
-      .cgh-print-content svg {
+      .cgh-print-content svg:not(.katex svg) {
         max-width: 100%;
         overflow: visible;
+      }
+
+      .cgh-print-content .katex .hide-tail,
+      .cgh-print-content .katex .katex-stretchy,
+      .cgh-print-content .katex .stretchy {
+        overflow: hidden !important;
+        overflow-x: hidden !important;
+        overflow-y: hidden !important;
       }
 
       .cgh-print-content .katex .fbox,
@@ -1702,11 +1542,39 @@ ${text}\n\
       '[class*="markdown"]',
     ];
 
+    const getContentText = (element) => {
+      const clone = element.cloneNode(true);
+      clone.querySelectorAll([
+        'button',
+        '[role="button"]',
+        '[data-testid*="copy"]',
+        '[data-testid*="turn-action"]',
+        '#cgh-panel',
+        '#cgh-toast',
+      ].join(',')).forEach((child) => child.remove());
+      return normalizeWhitespace(clone.textContent || '');
+    };
+
+    const sourceText = getContentText(node);
+    if (!sourceText) return null;
+
+    const matchingNodes = new Set();
     for (const selector of candidates) {
-      const candidate = node.matches(selector) ? node : node.querySelector(selector);
-      if (candidate instanceof Element && normalizeWhitespace(candidate.textContent || '')) {
-        return candidate;
-      }
+      if (node.matches(selector)) matchingNodes.add(node);
+      node.querySelectorAll(selector).forEach((candidate) => matchingNodes.add(candidate));
+    }
+
+    const candidatesByCoverage = [...matchingNodes]
+      .map((candidate) => ({ candidate, text: getContentText(candidate) }))
+      .filter(({ text }) => text)
+      .sort((left, right) => right.text.length - left.text.length);
+
+    const bestCandidate = candidatesByCoverage[0];
+    // A turn can contain several markdown fragments. Exporting just the longest
+    // fragment would silently drop the rest, so use the complete message when
+    // no single candidate covers nearly all of its readable text.
+    if (bestCandidate && bestCandidate.text.length / sourceText.length >= 0.8) {
+      return bestCandidate.candidate;
     }
 
     return null;
@@ -1757,6 +1625,7 @@ ${text}\n\
     for (const element of elements) {
       if (!(element instanceof HTMLElement)) continue;
       if (element.matches('table, th, td, img, svg, math, .katex, mjx-container')) continue;
+      if (element.closest('.katex')) continue;
       if (!element.matches('pre') && !hasExportOverflowBehavior(element)) continue;
       element.classList.add('cgh-export-overflow-wrap');
       element.style.setProperty('max-width', '100%', 'important');
@@ -2464,148 +2333,6 @@ ${text}\n\
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  async function buildPdfFromPngParts(dataUrls) {
-    if (!dataUrls.length) throw new Error('没有可写入 PDF 的图片');
-
-    const images = [];
-    for (const dataUrl of dataUrls) {
-      const image = await loadImage(dataUrl);
-      images.push(await preparePdfImage(image));
-    }
-
-    return createImagePdf(images);
-  }
-
-  async function preparePdfImage(image) {
-    const width = image.naturalWidth || image.width;
-    const height = image.naturalHeight || image.height;
-    if (!width || !height) throw new Error('图片尺寸无效');
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext('2d', { willReadFrequently: true });
-    if (!context) throw new Error('Canvas context unavailable');
-
-    context.fillStyle = '#0d0d0d';
-    context.fillRect(0, 0, width, height);
-    context.drawImage(image, 0, 0, width, height);
-
-    const rgba = context.getImageData(0, 0, width, height).data;
-    const rgb = new Uint8Array(width * height * 3);
-    for (let source = 0, target = 0; source < rgba.length; source += 4, target += 3) {
-      rgb[target] = rgba[source];
-      rgb[target + 1] = rgba[source + 1];
-      rgb[target + 2] = rgba[source + 2];
-    }
-
-    const compressed = await deflatePdfBytes(rgb);
-    return {
-      width,
-      height,
-      data: compressed.data,
-      filter: compressed.filter,
-    };
-  }
-
-  async function deflatePdfBytes(bytes) {
-    if (typeof CompressionStream !== 'function') {
-      return { data: bytes, filter: '' };
-    }
-
-    try {
-      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate'));
-      const blob = await new Response(stream).blob();
-      return {
-        data: new Uint8Array(await blob.arrayBuffer()),
-        filter: '/Filter /FlateDecode',
-      };
-    } catch (error) {
-      console.warn('[CGH] PDF compression failed, writing raw image stream', error);
-      return { data: bytes, filter: '' };
-    }
-  }
-
-  function createImagePdf(images) {
-    const pageTreeId = 2;
-    const objectCount = 2 + images.length * 3;
-    const pageIds = images.map((_, index) => 3 + index * 3);
-    const chunks = [];
-    const offsets = new Array(objectCount + 1).fill(0);
-    const encoder = new TextEncoder();
-    let byteOffset = 0;
-
-    const appendString = (value) => {
-      const bytes = encoder.encode(value);
-      chunks.push(bytes);
-      byteOffset += bytes.length;
-    };
-
-    const appendBytes = (bytes) => {
-      chunks.push(bytes);
-      byteOffset += bytes.length;
-    };
-
-    const addObject = (id, parts) => {
-      offsets[id] = byteOffset;
-      appendString(`${id} 0 obj\n`);
-      for (const part of Array.isArray(parts) ? parts : [parts]) {
-        if (typeof part === 'string') appendString(part);
-        else appendBytes(part);
-      }
-      appendString('\nendobj\n');
-    };
-
-    appendString('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
-    addObject(1, '<< /Type /Catalog /Pages 2 0 R >>');
-    addObject(pageTreeId, `<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] >>`);
-
-    images.forEach((image, index) => {
-      const pageId = 3 + index * 3;
-      const contentId = pageId + 1;
-      const imageId = pageId + 2;
-      const pageSize = getPdfPageSize(image.width, image.height);
-      const pageWidth = formatPdfNumber(pageSize.width);
-      const pageHeight = formatPdfNumber(pageSize.height);
-      const content = `q\n${pageWidth} 0 0 ${pageHeight} 0 0 cm\n/Im${index + 1} Do\nQ`;
-
-      addObject(pageId, `<< /Type /Page /Parent ${pageTreeId} 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /XObject << /Im${index + 1} ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>`);
-      addObject(contentId, `<< /Length ${encoder.encode(content).length} >>\nstream\n${content}\nendstream`);
-      addObject(imageId, [
-        `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Interpolate false ${image.filter} /Length ${image.data.length} >>\nstream\n`,
-        image.data,
-        '\nendstream',
-      ]);
-    });
-
-    const xrefOffset = byteOffset;
-    appendString(`xref\n0 ${objectCount + 1}\n`);
-    appendString('0000000000 65535 f \n');
-    for (let id = 1; id <= objectCount; id += 1) {
-      appendString(`${String(offsets[id]).padStart(10, '0')} 00000 n \n`);
-    }
-    appendString(`trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
-
-    return new Blob(chunks, { type: 'application/pdf' });
-  }
-
-  function getPdfPageSize(imageWidth, imageHeight) {
-    const a4WidthPoints = 595.28;
-    const maxPagePoints = 14400;
-    const heightAtA4Width = a4WidthPoints * imageHeight / imageWidth;
-    const width = heightAtA4Width > maxPagePoints
-      ? maxPagePoints * imageWidth / imageHeight
-      : a4WidthPoints;
-    return {
-      width,
-      height: width * imageHeight / imageWidth,
-    };
-  }
-
-  function formatPdfNumber(value) {
-    return Number(value).toFixed(2).replace(/\.?0+$/, '') || '0';
-  }
-
   function buildExportFilename(partIndex = 0, partCount = 1, extension = 'png') {
     const now = new Date();
     const pad = value => String(value).padStart(2, '0');
@@ -2629,87 +2356,6 @@ ${text}\n\
     return '未知错误';
   }
 
-  function queueMessageJump(index) {
-    pendingJump = { index, token: ++jumpSequence };
-    if (jumpRunning) return;
-    void processPendingJump();
-  }
-
-  async function processPendingJump() {
-    if (jumpRunning) return;
-    jumpRunning = true;
-
-    try {
-      while (pendingJump) {
-        const request = pendingJump;
-        pendingJump = null;
-        await jumpToMessage(request.index, request.token);
-      }
-    } finally {
-      jumpRunning = false;
-    }
-  }
-
-  async function jumpToMessage(index, token) {
-    const initialMessage = currentMessages[index];
-    if (!initialMessage) {
-      showToast('未找到对应消息');
-      return;
-    }
-
-    if (isConversationLoading()) {
-      showToast('正在加载对话...', 0);
-    }
-
-    const initialContainer = getMessageScrollContainer(initialMessage.node);
-    await disengageAutoFollow(initialContainer, token);
-    if (!isLatestJumpToken(token)) return;
-
-    const ready = await waitForConversationReady(token);
-    if (!isLatestJumpToken(token)) return;
-
-    if (!ready) {
-      showToast('正在加载对话，请稍后再试');
-      return;
-    }
-
-    currentMessages = collectMessages();
-    if (!isLatestJumpToken(token)) return;
-
-    let message = currentMessages[index];
-    if (message?.signature !== initialMessage.signature) {
-      const matched = currentMessages.find(item => item.signature === initialMessage.signature);
-      if (matched) {
-        message = matched;
-      } else if (!message) {
-        message = initialMessage;
-      }
-    }
-
-    const node = message?.node;
-    if (!(node instanceof Element) || !node.isConnected) {
-      showToast('未找到对应消息');
-      return;
-    }
-
-    const container = getMessageScrollContainer(node);
-    await disengageAutoFollow(container, token);
-    if (!isLatestJumpToken(token)) return;
-
-    await waitForScrollIdle(container, token, PRE_JUMP_SCROLL_IDLE_TIMEOUT_MS, PRE_JUMP_SCROLL_IDLE_MS);
-    if (!isLatestJumpToken(token)) return;
-
-    await scrollMessageIntoView(node, container, token);
-
-    if (!isLatestJumpToken(token)) return;
-    highlightMessageNode(node);
-    showToast(`已定位到第 ${index + 1} 条消息`);
-  }
-
-  function isLatestJumpToken(token) {
-    return token === jumpSequence;
-  }
-
   function buildMessageSignature(node, role, text) {
     const stableId = [
       node.getAttribute?.('data-message-id'),
@@ -2729,354 +2375,11 @@ ${text}\n\
     return (hash >>> 0).toString(36);
   }
 
-  function isConversationLoading() {
-    const loadingSelectors = [
-      'main button[aria-label*="Stop generating"]',
-      'main button[aria-label*="停止生成"]',
-      'main [aria-busy="true"]',
-      'main [data-testid*="stop-generating"]',
-      'main [data-testid*="loading"]',
-    ].join(',');
-
-    if (document.querySelector(loadingSelectors)) return true;
-    return performance.now() - lastConversationMutationAt < 350;
-  }
-
-  async function waitForConversationReady(token, timeoutMs = 6000) {
-    const deadline = performance.now() + timeoutMs;
-    let sawBusy = false;
-
-    while (performance.now() < deadline) {
-      if (!isLatestJumpToken(token)) return false;
-
-      const loading = isConversationLoading();
-      const quietFor = performance.now() - lastConversationMutationAt;
-      if (!loading && quietFor >= CONVERSATION_READY_QUIET_MS) {
-        return true;
-      }
-
-      sawBusy = sawBusy || loading || quietFor < CONVERSATION_READY_QUIET_MS;
-      if (sawBusy) {
-        showToast('正在加载对话...', 0);
-      }
-
-      await waitForLayoutStability(120);
-    }
-
-    return !isConversationLoading() && performance.now() - lastConversationMutationAt >= CONVERSATION_READY_QUIET_MS;
-  }
-
-  async function scrollMessageIntoView(node, container, token) {
-    if (!(node instanceof Element)) return;
-
-    const restoreOverflowAnchors = suspendOverflowAnchors(container);
-    const restoreFocus = suspendScrollSensitiveFocus();
-
-    try {
-      if (!isLatestJumpToken(token) || !node.isConnected) return;
-
-      const targetTop = getTargetScrollTopForNode(container, node);
-      const currentTop = getScrollTop(container);
-      const distance = Math.abs(targetTop - currentTop);
-      if (distance <= 8 && isNodeCenteredEnough(node, container)) {
-        return;
-      }
-
-      scrollContainerTo(container, targetTop, 'smooth');
-      await waitForScrollToSettle(container, distance > 240 ? 1400 : 900);
-      if (!isLatestJumpToken(token) || !node.isConnected) return;
-
-      if (isNodeCenteredEnough(node, container)) {
-        return;
-      }
-
-      await waitForScrollIdle(container, token, 600, 120);
-      if (!isLatestJumpToken(token) || !node.isConnected) return;
-
-      const correctedTop = getTargetScrollTopForNode(container, node);
-      scrollContainerTo(container, correctedTop, 'auto');
-      await waitForScrollToSettle(container, 400);
-    } finally {
-      restoreOverflowAnchors();
-      restoreFocus();
-    }
-  }
-
-  function getMessageScrollContainer(node) {
-    let current = node.parentElement;
-    while (current && current !== document.body) {
-      const style = window.getComputedStyle(current);
-      const overflowY = style.overflowY || style.overflow;
-      if (/(auto|scroll|overlay)/.test(overflowY) && current.scrollHeight > current.clientHeight + 1) {
-        return current;
-      }
-      current = current.parentElement;
-    }
-
-    return document.scrollingElement || document.documentElement;
-  }
-
-  function suspendOverflowAnchors(container) {
-    const targets = new Set([document.documentElement, document.body]);
-    if (container instanceof HTMLElement) {
-      targets.add(container);
-    }
-
-    const snapshots = [];
-    for (const target of targets) {
-      if (!(target instanceof HTMLElement)) continue;
-      snapshots.push({ target, overflowAnchor: target.style.overflowAnchor });
-      target.style.overflowAnchor = 'none';
-    }
-
-    return () => {
-      for (const snapshot of snapshots) {
-        snapshot.target.style.overflowAnchor = snapshot.overflowAnchor;
-      }
-    };
-  }
-
-  function suspendScrollSensitiveFocus() {
-    const activeElement = document.activeElement;
-    if (!(activeElement instanceof HTMLElement) || !isScrollSensitiveFocusTarget(activeElement)) {
-      return () => {};
-    }
-
-    try {
-      activeElement.blur();
-    } catch (error) {
-      return () => {};
-    }
-
-    return () => {};
-  }
-
-  function isScrollSensitiveFocusTarget(node) {
-    if (!(node instanceof HTMLElement)) return false;
-    if (node.closest('#cgh-panel') || node.closest('#cgh-toast')) return false;
-
-    if (node.isContentEditable) return true;
-    if (node.getAttribute('role') === 'textbox') return true;
-    if (node instanceof HTMLTextAreaElement) return true;
-    if (node instanceof HTMLInputElement) {
-      return !['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(node.type);
-    }
-
-    return false;
-  }
-
-  function isRootScrollContainer(container) {
-    return container === document.scrollingElement || container === document.documentElement || container === document.body;
-  }
-
-  function getScrollTop(container) {
-    if (isRootScrollContainer(container)) {
-      return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
-    }
-    return container.scrollTop;
-  }
-
-  function getContainerViewportHeight(container) {
-    if (isRootScrollContainer(container)) {
-      return window.innerHeight || document.documentElement.clientHeight || 0;
-    }
-    return container.clientHeight;
-  }
-
-  function getContainerMaxScrollTop(container) {
-    if (isRootScrollContainer(container)) {
-      const root = document.scrollingElement || document.documentElement;
-      return Math.max(0, root.scrollHeight - root.clientHeight);
-    }
-    return Math.max(0, container.scrollHeight - container.clientHeight);
-  }
-
-  function getDistanceToBottom(container) {
-    return Math.max(0, getContainerMaxScrollTop(container) - getScrollTop(container));
-  }
-
-  function getNodeTopWithinContainer(node, container) {
-    const nodeRect = node.getBoundingClientRect();
-    if (isRootScrollContainer(container)) {
-      return getScrollTop(container) + nodeRect.top;
-    }
-
-    const containerRect = container.getBoundingClientRect();
-    return container.scrollTop + nodeRect.top - containerRect.top;
-  }
-
-  function getTargetScrollTopForNode(container, node) {
-    const nodeTop = getNodeTopWithinContainer(node, container);
-    const viewportHeight = getContainerViewportHeight(container);
-    const nodeHeight = Math.min(node.getBoundingClientRect().height, viewportHeight);
-    const paddingTop = Math.max(24, (viewportHeight - nodeHeight) / 2);
-    return clamp(nodeTop - paddingTop, 0, getContainerMaxScrollTop(container));
-  }
-
-  function scrollContainerTo(container, top, behavior = 'auto') {
-    const nextTop = Math.round(top);
-    if (isRootScrollContainer(container)) {
-      window.scrollTo({ top: nextTop, behavior });
-      return;
-    }
-
-    if (typeof container.scrollTo === 'function') {
-      container.scrollTo({ top: nextTop, behavior });
-      return;
-    }
-
-    container.scrollTop = nextTop;
-  }
-
-  async function waitForScrollToSettle(container, timeoutMs = 1000) {
-    const deadline = performance.now() + timeoutMs;
-    let lastTop = getScrollTop(container);
-    let stableSince = performance.now();
-
-    while (performance.now() < deadline) {
-      await waitForLayoutStability(60);
-      const nextTop = getScrollTop(container);
-      if (Math.abs(nextTop - lastTop) > SCROLL_POSITION_EPSILON) {
-        lastTop = nextTop;
-        stableSince = performance.now();
-        continue;
-      }
-
-      if (performance.now() - stableSince >= SCROLL_SETTLE_QUIET_MS) {
-        return;
-      }
-    }
-  }
-
-  async function disengageAutoFollow(container, token) {
-    if (!container) return;
-
-    const currentTop = getScrollTop(container);
-    const distanceToBottom = getDistanceToBottom(container);
-    if (distanceToBottom > AUTO_FOLLOW_BOTTOM_THRESHOLD_PX) {
-      return;
-    }
-
-    const viewportHeight = getContainerViewportHeight(container);
-    const escapeDistance = Math.max(
-      AUTO_FOLLOW_ESCAPE_PX,
-      Math.min(Math.round(viewportHeight * 0.18), 180)
-    );
-    const targetTop = Math.max(0, currentTop - escapeDistance);
-    if (Math.abs(targetTop - currentTop) <= SCROLL_POSITION_EPSILON) {
-      return;
-    }
-
-    scrollContainerTo(container, targetTop, 'auto');
-    dispatchSyntheticScrollHint(container, currentTop, targetTop);
-    await waitForScrollIdle(container, token, 500, 120);
-  }
-
-  function dispatchSyntheticScrollHint(container, previousTop, nextTop) {
-    const deltaY = previousTop - nextTop;
-    const target = isRootScrollContainer(container) ? window : container;
-
-    try {
-      target.dispatchEvent(new Event('scroll'));
-    } catch (error) {
-      // Ignore dispatch failures on locked-down targets.
-    }
-
-    try {
-      target.dispatchEvent(new WheelEvent('wheel', {
-        deltaY,
-        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-        bubbles: true,
-        cancelable: true,
-      }));
-    } catch (error) {
-      // Ignore browsers that reject synthetic wheel events.
-    }
-  }
-
-  async function waitForScrollIdle(container, token, timeoutMs = 1500, idleMs = PRE_JUMP_SCROLL_IDLE_MS) {
-    const deadline = performance.now() + timeoutMs;
-    let lastTop = getScrollTop(container);
-    let idleSince = performance.now();
-
-    while (performance.now() < deadline) {
-      if (!isLatestJumpToken(token)) return false;
-
-      await waitForLayoutStability(60);
-      const nextTop = getScrollTop(container);
-      if (Math.abs(nextTop - lastTop) > SCROLL_POSITION_EPSILON) {
-        lastTop = nextTop;
-        idleSince = performance.now();
-        continue;
-      }
-
-      if (performance.now() - idleSince >= idleMs) {
-        return true;
-      }
-    }
-
-    return true;
-  }
-
-  function isNodeCenteredEnough(node, container) {
-    if (!(node instanceof Element) || !isNodeVisibleEnough(node)) return false;
-
-    const rect = node.getBoundingClientRect();
-    const viewportHeight = getContainerViewportHeight(container);
-    if (!viewportHeight) return false;
-
-    let viewportTop = 0;
-    if (!isRootScrollContainer(container)) {
-      viewportTop = container.getBoundingClientRect().top;
-    }
-
-    const viewportCenter = viewportTop + viewportHeight / 2;
-    const nodeCenter = rect.top + rect.height / 2;
-    const tolerance = Math.max(48, Math.min(160, viewportHeight * 0.18));
-    return Math.abs(nodeCenter - viewportCenter) <= tolerance;
-  }
-
-  function isNodeVisibleEnough(node) {
-    if (!(node instanceof Element)) return false;
-
-    const rect = node.getBoundingClientRect();
-    if (!rect.width || !rect.height) return false;
-
-    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-
-    return rect.bottom > 0 && rect.top < viewportHeight && rect.right > 0 && rect.left < viewportWidth;
-  }
-
   async function waitForLayoutStability(delayMs = 120) {
     if (document.visibilityState === 'hidden') return;
     await new Promise(resolve => window.setTimeout(resolve, delayMs));
     if (document.visibilityState === 'hidden') return;
     await waitForAnimationFrames(window);
-  }
-
-  function highlightMessageNode(node) {
-    if (!(node instanceof HTMLElement)) return;
-
-    if (highlightedMessageTimer) {
-      window.clearTimeout(highlightedMessageTimer);
-      highlightedMessageTimer = null;
-    }
-
-    highlightedMessageNode = node;
-    if (!highlightedMessageOutline) highlightedMessageOutline = createMessageOutline('cgh-target-outline');
-    highlightedMessageOutline.node = node;
-    ensureMessageOutlineTracking();
-    scheduleMessageOutlineUpdate();
-
-    highlightedMessageTimer = window.setTimeout(() => {
-      if (highlightedMessageNode === node) {
-        highlightedMessageNode = null;
-        removeMessageOutline(highlightedMessageOutline);
-        highlightedMessageOutline = null;
-      }
-      highlightedMessageTimer = null;
-    }, 1800);
   }
 
   function createMessageOutline(kind) {
@@ -3144,7 +2447,6 @@ ${text}\n\
     outlineUpdateQueued = true;
     window.requestAnimationFrame(() => {
       outlineUpdateQueued = false;
-      if (highlightedMessageOutline) positionMessageOutline(highlightedMessageOutline);
       if (hoveredMessageOutline) positionMessageOutline(hoveredMessageOutline);
       for (const outline of selectedMessageOutlines.values()) positionMessageOutline(outline);
     });
@@ -3210,6 +2512,30 @@ ${text}\n\
     }
     if (element.style.getPropertyValue(property) !== value || element.style.getPropertyPriority?.(property) !== 'important') {
       element.style.setProperty(property, value, 'important');
+    }
+  }
+
+  function restoreReadingStyleProperty(element, property) {
+    const original = readingStyleBackup.get(element);
+    if (!original?.has(property)) return;
+    const saved = original.get(property);
+    if (saved.value) element.style.setProperty(property, saved.value, saved.priority);
+    else element.style.removeProperty(property);
+    original.delete(property);
+    if (original.size === 0) readingStyleBackup.delete(element);
+  }
+
+  function applyReadingStyleSet(elements, property, value, enabled) {
+    const active = enabled ? elements : new Set();
+    for (const element of readingStyleBackup.keys()) {
+      if (!active.has(element)) restoreReadingStyleProperty(element, property);
+    }
+    if (enabled) for (const element of elements) setReadingStyle(element, property, value);
+  }
+
+  function restoreInactiveReadingStyles(elements, property) {
+    for (const element of readingStyleBackup.keys()) {
+      if (!elements.has(element)) restoreReadingStyleProperty(element, property);
     }
   }
 
@@ -3325,12 +2651,16 @@ ${text}\n\
         spacingNodes.add(element);
       }
     }
-    const baseSizes = new Map([...fontNodes].map(element => [element, getReadingBaseFontSize(element)]));
-    for (const [element, base] of baseSizes) {
-      setReadingStyle(element, 'font-size', `${Math.round(base * settings.fontScale) / 100}px`);
+    if (settings.fontScale === 0) {
+      applyReadingStyleSet(new Set(), 'font-size', '', false);
+      readingBaseFontSizes = new WeakMap();
+    } else {
+      const baseSizes = new Map([...fontNodes].map(element => [element, getReadingBaseFontSize(element)]));
+      for (const [element, base] of baseSizes) setReadingStyle(element, 'font-size', `${Math.round(base * settings.fontScale) / 100}px`);
+      restoreInactiveReadingStyles(fontNodes, 'font-size');
     }
-    for (const element of lineNodes) setReadingStyle(element, 'line-height', lineHeight);
-    for (const element of spacingNodes) setReadingStyle(element, 'margin-block', spacing);
+    applyReadingStyleSet(lineNodes, 'line-height', lineHeight, settings.lineHeight !== 0);
+    applyReadingStyleSet(spacingNodes, 'margin-block', spacing, settings.paragraphSpacing !== 0);
 
     const widthNodes = new Set(document.querySelectorAll('main #thread [class*="thread-content-max-width"], main [data-testid^="conversation-turn-"] [class*="thread-content-max-width"]'));
     for (const content of contentNodes) {
@@ -3352,11 +2682,9 @@ ${text}\n\
         }
       }
     }
-    for (const node of widthNodes) {
-      setReadingStyle(node, '--thread-content-max-width', width);
-      setReadingStyle(node, 'max-width', width);
-      setReadingStyle(node, 'width', '100%');
-    }
+    applyReadingStyleSet(widthNodes, '--thread-content-max-width', width, settings.readingWidth !== 0);
+    applyReadingStyleSet(widthNodes, 'max-width', width, settings.readingWidth !== 0);
+    applyReadingStyleSet(widthNodes, 'width', '100%', settings.readingWidth !== 0);
     const sample = [...textNodes].find(node => {
       const rect = node.getBoundingClientRect?.();
       const viewportHeight = document.defaultView?.innerHeight;
@@ -3365,7 +2693,7 @@ ${text}\n\
     const computedFontSize = sample && document.defaultView?.getComputedStyle
       ? parseFloat(document.defaultView.getComputedStyle(sample).fontSize)
       : parseFloat(sample?.style.getPropertyValue('font-size'));
-    const expectedFontSize = sample ? getReadingBaseFontSize(sample) * settings.fontScale / 100 : NaN;
+    const expectedFontSize = sample && settings.fontScale !== 0 ? getReadingBaseFontSize(sample) * settings.fontScale / 100 : NaN;
     const computedLineHeight = sample
       ? document.defaultView?.getComputedStyle?.(sample)?.lineHeight || sample.style.getPropertyValue('line-height')
       : null;
@@ -3376,7 +2704,9 @@ ${text}\n\
     return {
       readingTargets: contentNodes.length,
       widthTargets: widthNodes.size,
-      readingVerified: Number.isFinite(computedFontSize) && Math.abs(computedFontSize - expectedFontSize) < 0.5,
+      readingVerified: settings.fontScale === 0
+        ? true
+        : Number.isFinite(computedFontSize) && Math.abs(computedFontSize - expectedFontSize) < 0.5,
       diagnostics: {
         source,
         route,

@@ -58,6 +58,66 @@ test('reading settings change message text and column width, then restore previo
   assert.equal(widthNode.style.getPropertyValue('max-width'), '768px');
 });
 
+test('original reading values restore only their own inline styles', () => {
+  const { document } = parseHTML(`
+    <main><article data-testid="conversation-turn-1">
+      <div class="max-w-[var(--thread-content-max-width)]" style="--thread-content-max-width: 777px !important; max-width: 777px !important; width: 95% !important">
+        <div data-message-author-role="assistant">
+          <div class="markdown"><p style="font-size: 18px !important; line-height: 1.25 !important; margin-block: 0.4em !important">原版排版</p></div>
+        </div>
+      </div>
+    </article></main>
+  `);
+  const settings = { readingEnabled: true, readingWidth: 0, fontScale: 0, lineHeight: 0, paragraphSpacing: 0 };
+  const { applyReadingSettings } = createReadingHarness(document, settings);
+  const paragraph = document.querySelector('.markdown p');
+  const widthNode = document.querySelector('[class*="thread-content-max-width"]');
+  const inlineValue = (element, property) => {
+    const value = element.style.getPropertyValue(property);
+    const priority = element.style.getPropertyPriority?.(property) || '';
+    if (value.endsWith(' !important')) return value;
+    return priority === 'important' ? `${value} !important` : value;
+  };
+
+  const originalResult = applyReadingSettings();
+  assert.equal(originalResult.readingVerified, true);
+  assert.equal(inlineValue(widthNode, '--thread-content-max-width'), '777px !important');
+  assert.equal(inlineValue(widthNode, 'max-width'), '777px !important');
+  assert.equal(inlineValue(widthNode, 'width'), '95% !important');
+  assert.equal(inlineValue(paragraph, 'font-size'), '18px !important');
+  assert.equal(inlineValue(paragraph, 'line-height'), '1.25 !important');
+  assert.equal(inlineValue(paragraph, 'margin-block'), '0.4em !important');
+
+  settings.readingWidth = 1000;
+  settings.fontScale = 130;
+  settings.lineHeight = 1.8;
+  settings.paragraphSpacing = 0.8;
+  applyReadingSettings();
+  assert.equal(widthNode.style.getPropertyValue('max-width'), '1000px');
+  assert.equal(widthNode.style.getPropertyValue('--thread-content-max-width'), '1000px');
+  assert.equal(widthNode.style.getPropertyValue('width'), '100%');
+  assert.equal(paragraph.style.getPropertyValue('font-size'), '23.4px');
+  assert.equal(paragraph.style.getPropertyValue('line-height'), '1.8');
+  assert.equal(paragraph.style.getPropertyValue('margin-block'), '0.8em');
+
+  settings.readingWidth = 0;
+  settings.lineHeight = 0;
+  applyReadingSettings();
+  assert.equal(inlineValue(widthNode, '--thread-content-max-width'), '777px !important');
+  assert.equal(inlineValue(widthNode, 'max-width'), '777px !important');
+  assert.equal(inlineValue(widthNode, 'width'), '95% !important');
+  assert.equal(inlineValue(paragraph, 'line-height'), '1.25 !important');
+  assert.equal(paragraph.style.getPropertyValue('font-size'), '23.4px');
+  assert.equal(paragraph.style.getPropertyValue('margin-block'), '0.8em');
+
+  settings.fontScale = 0;
+  settings.paragraphSpacing = 0;
+  applyReadingSettings();
+  assert.equal(inlineValue(paragraph, 'font-size'), '18px !important');
+  assert.equal(inlineValue(paragraph, 'line-height'), '1.25 !important');
+  assert.equal(inlineValue(paragraph, 'margin-block'), '0.4em !important');
+});
+
 test('reading settings also handle message containers without conversation turn testids', () => {
   const { document } = parseHTML(`
     <main><div id="thread"><div class="max-w-[var(--thread-content-max-width)]" style="max-width: 720px">

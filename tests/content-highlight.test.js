@@ -7,6 +7,113 @@ const { parseHTML } = require('linkedom');
 const source = fs.readFileSync(path.join(__dirname, '..', 'chatgpt-helper-extension', 'content.js'), 'utf8');
 const styles = fs.readFileSync(path.join(__dirname, '..', 'chatgpt-helper-extension', 'styles.css'), 'utf8');
 
+test('compact export toolbar exposes only message selection and three exports', () => {
+  const match = source.match(/panel\.innerHTML = `([\s\S]*?)`;/);
+  assert.ok(match, 'toolbar markup should be present');
+  const { document } = parseHTML(`<body>${match[1]}</body>`);
+  const actions = [...document.querySelectorAll('[data-action]')].map(button => button.getAttribute('data-action'));
+
+  assert.deepEqual(actions, ['export-select', 'export-png', 'export-markdown', 'export-print-pdf']);
+  assert.equal(document.querySelector('.cgh-title')?.textContent, '消息导出');
+  assert.equal(document.querySelector('[data-action="export-select"]')?.getAttribute('aria-pressed'), 'false');
+  assert.equal(document.querySelector('#cgh-export-status')?.getAttribute('aria-live'), 'polite');
+  assert.doesNotMatch(source, /data-action="(?:refresh|toggle|select-all|jump-message)"|#cgh-search|function renderTimeline\(/);
+});
+
+test('clicking a chat message in selection mode toggles that message', () => {
+  const start = source.indexOf('  function handleExportSelectionClick(event) {');
+  const end = source.indexOf('  function setExportSelectionMode(enabled', start);
+  assert.ok(start >= 0 && end > start);
+  const { document, window } = parseHTML('<body><main><article><p>Answer text</p></article></main><div id="cgh-panel"></div></body>');
+  const message = document.querySelector('article');
+  const toggled = [];
+  const handler = new Function('document', 'Element', 'toggled', `
+    let exportSelectionMode = true;
+    const currentMessages = [{ node: document.querySelector('article') }];
+    const toggleMessageSelection = index => toggled.push(index);
+    ${source.slice(start, end)}
+    return handleExportSelectionClick;
+  `)(document, window.Element, toggled);
+  const event = {
+    target: message.querySelector('p'),
+    preventDefault() {},
+    stopPropagation() {},
+  };
+
+  handler(event);
+  assert.deepEqual(toggled, [0]);
+  handler({ ...event, target: document.querySelector('#cgh-panel') });
+  assert.deepEqual(toggled, [0], 'toolbar clicks should not select chat messages');
+});
+
+test('entering selection mode scans messages before the next immediate page click', () => {
+  const selectStart = source.indexOf('  function setExportSelectionMode(enabled', 0);
+  const selectEnd = source.indexOf('  function toggleMessageSelection(', selectStart);
+  const clickStart = source.indexOf('  function handleExportSelectionClick(event) {');
+  const clickEnd = source.indexOf('  function setExportSelectionMode(enabled', clickStart);
+  assert.ok(selectStart >= 0 && selectEnd > selectStart && clickStart >= 0 && clickEnd > clickStart);
+
+  const { document, window } = parseHTML('<body><main><article><p>Freshly loaded answer</p></article></main></body>');
+  const message = document.querySelector('article');
+  const toggled = [];
+  const flow = new Function('document', 'Element', 'message', 'toggled', `
+    let exportSelectionMode = false;
+    let currentMessages = [];
+    const selectedMessageSignatures = new Set();
+    const syncConversationState = () => {};
+    const collectMessages = () => [{ node: message, signature: 'fresh-answer' }];
+    const syncSelectedMessagesWithCurrent = () => {};
+    const clearHoveredMessageOutline = () => {};
+    const updateExportUi = () => {};
+    const showToast = () => {};
+    const toggleMessageSelection = index => toggled.push(currentMessages[index]?.signature);
+    ${source.slice(selectStart, selectEnd)}
+    ${source.slice(clickStart, clickEnd)}
+    return { enter: () => setExportSelectionMode(true), click: handleExportSelectionClick };
+  `)(document, window.Element, message, toggled);
+
+  flow.enter();
+  flow.click({
+    target: message.querySelector('p'),
+    preventDefault() {},
+    stopPropagation() {},
+  });
+
+  assert.deepEqual(toggled, ['fresh-answer']);
+});
+
+test('toolbar reports selection count and enables exports only when messages are selected', () => {
+  const start = source.indexOf('  function updateExportUi() {');
+  const end = source.indexOf('  function updateSelectedMessageClasses() {', start);
+  assert.ok(start >= 0 && end > start);
+  const { document, window } = parseHTML(`
+    <body><div id="cgh-panel"><button data-action="export-select"></button>
+      <button data-action="export-png"></button><button data-action="export-markdown"></button>
+      <button data-action="export-print-pdf"></button><div id="cgh-export-status"></div>
+    </div></body>
+  `);
+  const panel = document.querySelector('#cgh-panel');
+  const selectedMessageSignatures = new Set();
+  const update = new Function('panel', 'selectedMessageSignatures', 'exportSelectionMode', 'exportRendering', 'activeExportFormat', 'updateSelectedMessageClasses', 'HTMLButtonElement', `
+    ${source.slice(start, end)}
+    return updateExportUi;
+  `)(panel, selectedMessageSignatures, false, false, null, () => {}, window.HTMLButtonElement);
+
+  update();
+  for (const button of panel.querySelectorAll('[data-action^="export-"]:not([data-action="export-select"])')) {
+    assert.equal(button.disabled, true);
+  }
+  assert.equal(panel.querySelector('#cgh-export-status').textContent, '未选择消息');
+
+  selectedMessageSignatures.add('one');
+  selectedMessageSignatures.add('two');
+  update();
+  for (const action of ['export-png', 'export-markdown', 'export-print-pdf']) {
+    assert.equal(panel.querySelector(`[data-action="${action}"]`).disabled, false);
+  }
+  assert.equal(panel.querySelector('#cgh-export-status').textContent, '已选择 2 条');
+});
+
 test('message outline is anchored to the page rather than the viewport', () => {
   assert.match(styles, /\.cgh-message-outline\s*\{\s*position:\s*absolute\s*;/);
 });
@@ -78,7 +185,7 @@ test('message outline stays anchored inside a scrolling message container', () =
 
 test('selected messages receive persistent outlines and clear them when deselected', () => {
   const start = source.indexOf('  function updateSelectedMessageClasses() {');
-  const end = source.indexOf('  function updateMessageListSelectionState() {', start);
+  const end = source.indexOf('  async function exportSelectedMessages(', start);
   assert.ok(start >= 0 && end > start);
   const { document, window } = parseHTML('<body><div id="message">Answer</div></body>');
   const message = document.querySelector('#message');
