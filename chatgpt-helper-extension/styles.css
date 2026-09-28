@@ -3,8 +3,12 @@
   right: 18px;
   bottom: 18px;
   z-index: 2147483647;
-  width: max-content;
+  display: flex;
+  flex-direction: column;
+  width: 236px;
   max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 36px);
+  overflow: hidden;
   border: 1px solid rgba(96, 165, 250, 0.28);
   border-radius: 10px;
   padding: 9px 10px;
@@ -24,12 +28,87 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 7px;
+  margin-bottom: 8px;
+}
+
+#cgh-panel.cgh-collapsed {
+  width: auto;
+  min-width: 0;
+  padding: 7px;
+}
+
+#cgh-panel.cgh-collapsed .cgh-header {
+  margin-bottom: 0;
+}
+
+#cgh-panel.cgh-collapsed .cgh-history-label,
+#cgh-panel.cgh-collapsed .cgh-list,
+#cgh-panel.cgh-collapsed .cgh-export {
+  display: none;
 }
 
 #cgh-panel .cgh-title {
   font-size: 13px;
   font-weight: 750;
+}
+
+#cgh-panel .cgh-history-label {
+  margin-bottom: 6px;
+  color: rgba(249, 250, 251, 0.72);
+  font-size: 11px;
+}
+
+#cgh-panel .cgh-list {
+  min-height: 0;
+  max-height: min(330px, 40vh);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+#cgh-panel .cgh-item {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  min-height: 38px;
+  border: 0;
+  border-radius: 5px;
+  padding: 6px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+#cgh-panel .cgh-item:hover {
+  background: rgba(96, 165, 250, 0.12);
+}
+
+#cgh-panel .cgh-item-selected {
+  background: rgba(37, 99, 235, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.72);
+}
+
+#cgh-panel .cgh-role {
+  color: #93a3b5;
+  font-size: 11px;
+}
+
+#cgh-panel .cgh-preview {
+  overflow: hidden;
+  color: #e8eee9;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#cgh-panel .cgh-empty {
+  padding: 14px 6px;
+  color: #93a3b5;
+  font-size: 11px;
+  text-align: center;
 }
 
 #cgh-panel .cgh-mini-btn {
@@ -62,12 +141,21 @@
 
 #cgh-panel .cgh-export {
   min-width: 0;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
 }
 
 #cgh-panel .cgh-export-buttons {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(3, 40px);
   gap: 5px;
+}
+
+#cgh-panel .cgh-export-buttons .cgh-mini-btn {
+  padding-right: 4px;
+  padding-left: 4px;
+  font-size: 11px;
 }
 
 #cgh-panel .cgh-export-status {
@@ -76,7 +164,8 @@
   font-size: 11px;
   line-height: 1.35;
 }
-#cgh-panel .cgh-mini-btn:focus-visible {
+#cgh-panel .cgh-mini-btn:focus-visible,
+#cgh-panel .cgh-item:focus-visible {
   outline: 2px solid #60a5fa;
   outline-offset: 2px;
 }
@@ -491,14 +580,12 @@
   #cgh-panel {
     right: 10px;
     bottom: calc(96px + env(safe-area-inset-bottom, 0px));
-    left: 10px;
-    width: auto;
-    max-width: none;
+    width: min(236px, calc(100vw - 20px));
+    max-height: calc(100vh - 110px - env(safe-area-inset-bottom, 0px));
   }
 
-  #cgh-panel .cgh-export-buttons {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) repeat(3, minmax(48px, auto));
+  #cgh-panel .cgh-list {
+    max-height: min(170px, 25vh);
   }
 }
 

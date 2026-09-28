@@ -94,6 +94,95 @@ test('print CSS gives frozen syntax colors priority over generic span colors', (
   assert.match(source, /\.cgh-export-syntax-token\s*\{[^}]*print-color-adjust:\s*exact;/s);
 });
 
+test('print export turns ChatGPT code chrome into a readable code card', () => {
+  const source = fs.readFileSync(contentPath, 'utf8');
+  const start = source.indexOf('  function normalizePrintCodeBlocks(root) {');
+  const end = source.indexOf('  function buildPrintPdfHtml(', start);
+  assert.ok(start >= 0 && end > start);
+  const { document } = parseHTML(`
+    <div class="cgh-print-content"><div class="MarkdownRoot-example">
+      <p>大量运算都要求：</p>
+      <div class="code-frame"><div class="code-header"><span>&lt;/&gt;</span><span>纯文本</span><button>复制</button></div>
+        <div class="code-scroll"><pre><code>寄存器 ↔ ALU ↔ 寄存器</code></pre></div></div>
+      <p>内存主要通过 LOAD / STORE 访问。</p>
+      <div class="code-frame"><div class="code-header"><span>纯文本</span></div>
+        <div class="code-scroll"><pre><code>指令种类少\n寻址方式少</code></pre></div></div>
+      <p>下一节。</p>
+    </div></div>
+  `);
+  const normalize = new Function('document', 'normalizeWhitespace', `
+    ${source.slice(start, end)}
+    return normalizePrintCodeBlocks;
+  `)(document, value => String(value).replace(/\s+/g, ' ').trim());
+  const root = document.querySelector('.cgh-print-content');
+  normalize(root);
+
+  const cards = [...root.querySelectorAll('.cgh-print-code-card')];
+  assert.equal(cards.length, 2);
+  assert.deepEqual(cards.map(card => card.querySelector('.cgh-print-code-label').textContent), ['纯文本', '纯文本']);
+  assert.match(cards[0].querySelector('pre').textContent, /寄存器 ↔ ALU/);
+  assert.match(cards[1].querySelector('pre').textContent, /指令种类少/);
+  assert.equal(root.querySelector('.code-frame'), null);
+  assert.deepEqual([...root.querySelectorAll('.MarkdownRoot-example > p')].map(p => p.textContent), [
+    '大量运算都要求：', '内存主要通过 LOAD / STORE 访问。', '下一节。'
+  ]);
+});
+
+test('print CSS separates code headers from larger code text', () => {
+  const source = fs.readFileSync(contentPath, 'utf8');
+  assert.match(source, /\.cgh-print-content \.cgh-print-code-label\s*\{[^}]*border-bottom:[^}]*background:/s);
+  assert.match(source, /\.cgh-print-content \.cgh-print-code-card pre\s*\{[^}]*padding: 10pt 11pt !important;[^}]*font-size: 10\.5pt;/s);
+  assert.match(source, /\.cgh-print-content \.cgh-print-code-card pre code,[\s\S]*?font-size: inherit !important;/);
+});
+
+test('markdown and rich export include every fragment of a grouped response', () => {
+  const source = fs.readFileSync(contentPath, 'utf8');
+  const markdownStart = source.indexOf('  function getMessageMarkdownRoot(message) {');
+  const markdownEnd = source.indexOf('  function domToMarkdown(root) {', markdownStart);
+  const richStart = source.indexOf('  function extractMessageExportContent(message) {');
+  const richEnd = source.indexOf('  function preserveCodeSyntaxStyles(', richStart);
+  assert.ok(markdownStart >= 0 && markdownEnd > markdownStart && richStart >= 0 && richEnd > richStart);
+
+  const { document } = parseHTML('<main><div id="thought">思考了 28m</div><p id="first">回答开头</p><table id="middle"><tr><td>21题</td></tr></table><p id="last">回答结尾</p></main>');
+  const contentNodes = ['first', 'middle', 'last'].map(id => document.querySelector(`#${id}`));
+  const message = { node: document.querySelector('#thought'), contentNodes };
+  const markdownRoot = new Function('document', 'findMessageContentNode', `
+    ${source.slice(markdownStart, markdownEnd)}
+    return getMessageMarkdownRoot;
+  `)(document, () => null)(message);
+  const richRoot = new Function('document', 'extractExportContent', `
+    ${source.slice(richStart, richEnd)}
+    return extractMessageExportContent;
+  `)(document, node => node.cloneNode(true))(message);
+
+  for (const root of [markdownRoot, richRoot]) {
+    assert.match(root.textContent, /回答开头/);
+    assert.match(root.textContent, /21题/);
+    assert.match(root.textContent, /回答结尾/);
+    assert.doesNotMatch(root.textContent, /思考了/);
+  }
+});
+
+test('content finder keeps a short final block outside a long prose body', () => {
+  const { document } = parseHTML(`
+    <div id="turn"><div class="prose"><p>这是一段很长的正文内容，详细解释了问题的背景、步骤和结果，并包含大部分回答文字。</p></div>
+      <p>最后一条结论。</p></div>
+  `);
+  const turn = document.querySelector('#turn');
+  assert.equal(loadMessageContentFinder()(turn), null);
+});
+
+test('content finder selects ChatGPT MarkdownRoot outside its hidden role heading', () => {
+  const { document } = parseHTML(`
+    <div data-content-search-unit-key="fallback-turn-1:2:assistant">
+      <h4 class="sr-only">ChatGPT 说</h4>
+      <div class="MarkdownRoot-example" data-markdown-text-style="assistant-message"><p>完整回答。</p></div>
+    </div>
+  `);
+  const unit = document.querySelector('[data-content-search-unit-key]');
+  assert.equal(loadMessageContentFinder()(unit), unit.querySelector('.MarkdownRoot-example'));
+});
+
 test('export overflow normalization preserves KaTeX clipping containers', () => {
   const { document } = parseHTML(`
     <div class="cgh-print-content">

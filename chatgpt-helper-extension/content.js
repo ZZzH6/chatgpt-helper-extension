@@ -6,6 +6,9 @@
 
   let settings = { ...DEFAULTS };
   let panel = null;
+  let messageList = null;
+  let renderedMessageListKey = null;
+  let panelCollapsed = true;
   let toastEl = null;
   let updateTimer = null;
   let observer = null;
@@ -32,6 +35,7 @@
   const readingStyleBackup = new Map();
   let readingBaseFontSizes = new WeakMap();
   const inferredMessageRoles = new WeakMap();
+  const messageTextCache = new WeakMap();
   const selectedMessageSignatures = new Set();
   const DRAFT_STORAGE_PREFIX = 'cghDraft:';
   const COMPOSER_SELECTORS = '#prompt-textarea, textarea[data-id="root"], textarea, div[contenteditable="true"].ProseMirror';
@@ -40,8 +44,8 @@
     'section[data-turn="user"]',
     'section[data-turn="assistant"]',
     '[data-message-author-role]',
-    '[data-message-id]',
-    'article[data-testid^="conversation-turn-"]',
+    '[data-testid="conversation-turn"]',
+    '[data-testid^="conversation-turn-"]',
     'main article',
     'main [role="article"]'
   ];
@@ -81,7 +85,9 @@
     attachSettingsMessageListener();
     startDraftSave();
     scheduleRefresh();
-    setInterval(scheduleRefresh, 5000);
+    setInterval(() => {
+      if (getConversationKey() !== activeConversationKey) scheduleRefresh();
+    }, 5000);
   }
 
   function attachStorageListener() {
@@ -105,6 +111,7 @@
       const readingResult = applyReadingSettings();
       if (settings.draftSaveEnabled) attachDraftInput();
       currentMessages = collectMessages();
+      renderMessageList();
       updateExportUi();
       sendResponse({ applied: true, readingEngineVersion: 7, navigationTargets: currentMessages.length, navigationSource, ...readingResult });
     });
@@ -140,13 +147,21 @@
       let shouldRefresh = false;
       for (const mutation of mutations) {
         if (mutation.type === 'childList') {
-          if ([...mutation.addedNodes].some(node => isRelevantNode(node))) {
+          const targetInMain = mutation.target instanceof Element
+            && (mutation.target.matches('main') || !!mutation.target.closest('main'));
+          const changedText = [...mutation.addedNodes, ...mutation.removedNodes]
+            .some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+          if ([...mutation.addedNodes].some(node => isRelevantNode(node))
+            || (targetInMain && [...mutation.removedNodes].some(node => isRelevantNode(node, true)))
+            || (changedText && isRelevantNode(mutation.target))) {
             shouldRefresh = true;
             break;
           }
         } else if (mutation.type === 'characterData') {
-          shouldRefresh = true;
-          break;
+          if (isRelevantNode(mutation.target.parentElement)) {
+            shouldRefresh = true;
+            break;
+          }
         }
       }
       if (shouldRefresh) scheduleRefresh();
@@ -158,16 +173,20 @@
     });
   }
 
-  function isRelevantNode(node) {
+  function isRelevantNode(node, wasInMain = false) {
     if (!(node instanceof Element)) return false;
     if (node.classList.contains('cgh-message-outline')) return false;
     if (node.id === 'cgh-panel' || node.id === 'cgh-toast' || node.id === 'cgh-formula-copy-feedback') return false;
     if (node.closest && (node.closest('#cgh-panel') || node.closest('#cgh-toast') || node.closest('#cgh-formula-copy-feedback'))) return false;
+    if (node.closest('form, [contenteditable="true"], #prompt-textarea, button, [role="button"]')) return false;
+    if (!wasInMain && !node.closest('main') && !node.matches('main')) return false;
+    const contentSelector = 'p, h1, h2, h3, h4, h5, h6, li, pre, table, .prose, .markdown, .whitespace-pre-wrap';
     return !!(
       node.matches?.(MESSAGE_SELECTORS.join(',')) ||
       node.querySelector?.(MESSAGE_SELECTORS.join(',')) ||
-      node.closest?.('main') ||
-      node.matches?.('main') ||
+      node.matches?.(contentSelector) ||
+      node.closest?.(contentSelector) ||
+      node.querySelector?.(contentSelector) ||
       node.matches?.(FORMULA_SELECTORS) ||
       node.querySelector?.(FORMULA_SELECTORS)
     );
@@ -186,6 +205,7 @@
     const messages = collectMessages();
     currentMessages = messages;
     syncSelectedMessagesWithCurrent();
+    renderMessageList();
     updateExportUi();
     attachDraftInput();
   }
@@ -204,7 +224,10 @@
     panel.innerHTML = `
       <div class="cgh-header">
         <div class="cgh-title">消息导出</div>
+        <button type="button" class="cgh-mini-btn cgh-panel-toggle" data-action="panel-toggle" aria-expanded="false">展开</button>
       </div>
+      <div class="cgh-history-label">历史对话</div>
+      <div class="cgh-list" id="cgh-list" aria-label="历史对话消息"></div>
       <div class="cgh-export">
         <div class="cgh-export-buttons">
           <button type="button" class="cgh-mini-btn cgh-select-btn" data-action="export-select" aria-pressed="false">选择消息</button>
@@ -219,7 +242,16 @@
     panel.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
-      const action = target.dataset.action;
+      const actionButton = target.closest('[data-action]');
+      if (!(actionButton instanceof HTMLElement) || !panel.contains(actionButton)) return;
+      const action = actionButton.dataset.action;
+      if (action === 'select-listed-message') {
+        const index = Number(actionButton.dataset.messageIndex);
+        if (Number.isInteger(index)) toggleMessageSelection(index);
+      }
+      if (action === 'panel-toggle') {
+        setPanelCollapsed(!panelCollapsed);
+      }
       if (action === 'export-select') {
         setExportSelectionMode(!exportSelectionMode, exportSelectionMode ? { clearSelection: true } : {});
       }
@@ -235,7 +267,22 @@
     });
 
     document.body.appendChild(panel);
+    messageList = panel.querySelector('#cgh-list');
+    renderedMessageListKey = null;
+    setPanelCollapsed(panelCollapsed);
     ensureExportSelectionListener();
+  }
+
+  function setPanelCollapsed(collapsed) {
+    panelCollapsed = collapsed;
+    if (!panel) return;
+    panel.classList.toggle('cgh-collapsed', collapsed);
+    const toggle = panel.querySelector('[data-action="panel-toggle"]');
+    if (toggle instanceof HTMLButtonElement) {
+      toggle.textContent = collapsed ? '展开' : '收起';
+      toggle.setAttribute('aria-expanded', String(!collapsed));
+      toggle.setAttribute('aria-label', collapsed ? '展开消息导出' : '收起消息导出');
+    }
   }
 
   function ensureFormulaUi() {
@@ -261,52 +308,293 @@
   }
 
   function collectMessages() {
-    const selector = MESSAGE_SELECTORS.join(',');
-    let nodes = [...document.querySelectorAll(selector)];
-
-    nodes = nodes.filter(node => !node.closest('#cgh-panel') && !node.closest('#cgh-toast'));
-    nodes = dedupeNodes(nodes);
+    const main = document.querySelector('main');
+    if (!main || !/(?:^|\/)(?:c|s)\/[^/]+/.test(location.pathname)) {
+      navigationSource = 'none';
+      return [];
+    }
+    const unitMessages = collectSearchUnitMessages(main);
+    if (unitMessages.some(message => message.role === 'assistant')) {
+      navigationSource = 'message units';
+      return unitMessages;
+    }
+    const pairedMessages = collectPairedMessages(main);
+    if (pairedMessages.some(message => message.role === 'assistant')) {
+      navigationSource = 'user turns';
+      return pairedMessages;
+    }
+    const nodes = dedupeNodes(dedupeNodes([...main.querySelectorAll(MESSAGE_SELECTORS.join(','))])
+      .map(expandThinkingMessageNode));
     const toMessages = candidates => {
       const messages = [];
+      const identityOccurrences = new Map();
       for (const node of candidates) {
         const role = inferRole(node);
-        const text = extractTextWithLatex(node);
+        const text = getMessageTextCached(node);
         if (!text.trim() && !hasExportableImages(node)) continue;
+        const body = role === 'assistant' && /^(?:思考了|思考中|Thinking|Thought for)/i.test(text)
+          ? node.querySelector('.prose, .markdown') : null;
+        const identity = buildMessageSignature(node, role, text);
+        const occurrence = identityOccurrences.get(identity) || 0;
+        identityOccurrences.set(identity, occurrence + 1);
         messages.push({
           role,
           text,
+          previewText: body ? getMessageTextCached(body) : text,
           node,
-          signature: buildMessageSignature(node, role, text),
+          identity,
+          // Text is not an identity: repeated code blocks and short replies
+          // must remain independently selectable and exportable.
+          signature: `${identity}|${occurrence}`,
         });
       }
       return messages;
     };
-    let messages = toMessages(nodes);
-    if (messages.length) {
+    const anchorMessages = dedupeMessages(toMessages(nodes));
+    const completeAnchors = anchorMessages.filter(message => message.role === 'user'
+      || message.node.querySelector('.prose, .markdown')).map(message => message.node);
+    const actionMessages = dedupeMessages(toMessages(findMessageNodesFromActions(completeAnchors)));
+    if (anchorMessages.length) {
+      const merged = mergeActionMessages(anchorMessages, actionMessages);
       navigationSource = 'message anchors';
-      return messages;
+      return merged;
     }
-    messages = toMessages(findMessageNodesFromActions());
-    if (messages.length) {
+    if (actionMessages.length) {
       navigationSource = 'copy actions';
-      return messages;
+      return actionMessages;
     }
-    messages = toMessages(findGenericMessageNodes());
-    navigationSource = messages.length ? 'main text' : 'none';
+    const messages = dedupeMessages(toMessages(findExportMessageBodies()));
+    navigationSource = messages.length ? 'message body' : 'none';
     return messages;
   }
 
-  function findMessageNodesFromActions() {
+  function collectSearchUnitMessages(main) {
+    // Current ChatGPT exposes turn-scoped user and assistant content units; thought blocks have no such role key.
+    const thread = main.querySelector('#thread, [data-testid="conversation-thread"]');
+    const root = thread?.querySelector('[data-content-search-unit-key]') ? thread : main;
+    const units = [...root.querySelectorAll('[data-content-search-unit-key], [data-chatgpt-search-unit-key]')];
+    const groups = new Map();
+    for (const [domIndex, node] of units.entries()) {
+      if (node.parentElement?.closest('[data-content-search-unit-key], [data-chatgpt-search-unit-key]')) continue;
+      const key = node.getAttribute('data-content-search-unit-key')
+        || node.getAttribute('data-chatgpt-search-unit-key') || '';
+      const match = key.match(/^(.*):(\d+):(user|assistant)$/);
+      if (!match) continue;
+      const [, turnKey, partIndex, role] = match;
+      const groupKey = `${turnKey}|${role}`;
+      if (!groups.has(groupKey)) groups.set(groupKey, { role, turnKey, nodes: [] });
+      groups.get(groupKey).nodes.push({ node, partIndex: Number(partIndex), domIndex });
+    }
+
+    const messages = [];
+    for (const group of groups.values()) {
+      const nodes = group.nodes.sort((left, right) => left.partIndex - right.partIndex)
+        .map(item => item.node);
+      const text = nodes.map(getMessageTextCached).filter(Boolean).join('\n\n');
+      if (!text && !nodes.some(hasExportableImages)) continue;
+      const message = createPairedMessage(group.role, nodes[0], nodes, text);
+      message.outlineNodes = nodes;
+      const rects = nodes.map(node => node.getBoundingClientRect?.()).filter(rect => Number.isFinite(rect?.top));
+      message.visualTop = rects.length ? Math.min(...rects.map(rect => rect.top)) : null;
+      message.turnIndex = Number(group.turnKey.match(/(?:^|-)turn-(\d+)$/)?.[1]);
+      message.partIndex = group.nodes[0].partIndex;
+      messages.push(message);
+    }
+    messages.sort((left, right) => {
+      if (left.visualTop !== null && right.visualTop !== null
+        && Math.abs(left.visualTop - right.visualTop) > 1) return left.visualTop - right.visualTop;
+      if (Number.isFinite(left.turnIndex) && Number.isFinite(right.turnIndex)
+        && left.turnIndex !== right.turnIndex) return left.turnIndex - right.turnIndex;
+      return left.partIndex - right.partIndex;
+    });
+    return dedupeMessages(messages);
+  }
+
+  function collectPairedMessages(main) {
+    // A user turn bounds the following assistant response, even when its body has several sibling roots.
+    const thread = main.querySelector('#thread, [data-testid="conversation-thread"]');
+    const root = thread?.querySelector('[data-message-author-role="user"], [data-turn="user"], .whitespace-pre-wrap')
+      ? thread : main;
+    const explicitUsers = [...root.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]')];
+    const userCandidates = explicitUsers.length ? explicitUsers : [...root.querySelectorAll('.whitespace-pre-wrap')];
+    const detectedUsers = dedupeNodes(userCandidates
+      .filter(node => !node.closest('pre, code, form, nav, aside, header, footer, .prose, .markdown, [data-message-author-role="assistant"]'))
+      .map(node => {
+        const turn = node.closest('[data-testid="conversation-turn"], [data-testid^="conversation-turn-"]');
+        return turn && !turn.querySelector('[data-message-author-role="assistant"], [data-turn="assistant"]') ? turn : node;
+      }));
+    if (!detectedUsers.length) return [];
+
+    const bodySelector = [
+      '[data-message-author-role="assistant"]', '[data-turn="assistant"]',
+      '.prose', '.markdown', '[class*="markdown"]', '[dir="auto"]',
+      'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'pre', 'table', 'blockquote', 'img'
+    ].join(',');
+    const detectedBodies = [...root.querySelectorAll(bodySelector)];
+    const userSet = new Set(detectedUsers);
+    const bodySet = new Set(detectedBodies);
+    const userNodes = [];
+    const candidates = [];
+    const order = new WeakMap();
+    // One walk orders both selector sets and avoids repeated position checks on long threads.
+    const walker = document.createTreeWalker(root, 1);
+    let position = 0;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      order.set(node, position++);
+      if (userSet.has(node)) userNodes.push(node);
+      if (bodySet.has(node)) candidates.push(node);
+    }
+    const messages = [];
+    let cursor = 0;
+
+    for (let index = 0; index < userNodes.length; index += 1) {
+      const userNode = userNodes[index];
+      const nextUser = userNodes[index + 1] || null;
+      const userText = getMessageTextCached(userNode);
+      if (userText || hasExportableImages(userNode)) {
+        messages.push(createPairedMessage('user', userNode, [userNode], userText));
+      }
+
+      while (cursor < candidates.length && !isAfterNode(candidates[cursor], userNode, order)) cursor += 1;
+      const answerNodes = [];
+      while (cursor < candidates.length && !isAtOrAfterNode(candidates[cursor], nextUser, order)) {
+        const candidate = candidates[cursor++];
+        if (candidate.contains(nextUser) || !isAnswerContentNode(candidate)) continue;
+        answerNodes.push(candidate);
+      }
+      const sources = dedupeNodes(answerNodes);
+      if (!sources.length) continue;
+      const exclusiveHost = findExclusiveAnswerHost(sources, userNode, nextUser, root);
+      const host = exclusiveHost || sources[0];
+      const answerText = sources.map(getMessageTextCached).filter(Boolean).join('\n\n');
+      if (answerText || sources.some(hasExportableImages)) {
+        const message = createPairedMessage('assistant', host, sources, answerText);
+        message.outlineNodes = exclusiveHost ? [exclusiveHost] : sources;
+        messages.push(message);
+      }
+    }
+    return dedupeMessages(messages);
+  }
+
+  function isAfterNode(node, boundary, order) {
+    return !boundary.contains(node) && order.get(node) > order.get(boundary);
+  }
+
+  function isAtOrAfterNode(node, boundary, order) {
+    return !!boundary && order.get(node) >= order.get(boundary);
+  }
+
+  function isAnswerContentNode(node) {
+    if (node.closest('form, nav, aside, header, footer, button, #cgh-panel, #cgh-toast, [data-message-author-role="user"], [data-turn="user"]')) return false;
+    if (node.closest('model-thoughts, .thoughts-container, .thoughts-content, [data-testid*="thinking" i], [data-testid*="thought" i]')) return false;
+    const text = normalizeWhitespace(node.textContent || '');
+    if (/^(?:思考了|思考中|Thinking|Thought for)/i.test(text)
+      && !node.querySelector('p, .prose, .markdown, pre, table')) return false;
+    return !!text || hasExportableImages(node);
+  }
+
+  function findExclusiveAnswerHost(nodes, userNode, nextUser, main) {
+    for (let parent = nodes[0].parentElement; parent && parent !== main; parent = parent.parentElement) {
+      if (!nodes.every(node => parent.contains(node))) continue;
+      if (parent.contains(userNode) || (nextUser && parent.contains(nextUser))) return null;
+      return parent;
+    }
+    return null;
+  }
+
+  function createPairedMessage(role, node, contentNodes, text) {
+    const identity = buildMessageSignature(node, role, text);
+    return { role, node, contentNodes, text, previewText: text, identity, signature: identity };
+  }
+
+  function getMessageTextCached(node) {
+    const raw = node.textContent || '';
+    const cached = messageTextCache.get(node);
+    if (cached?.raw === raw) return cached.text;
+    const text = extractTextWithLatex(node);
+    messageTextCache.set(node, { raw, text });
+    return text;
+  }
+
+  function mergeActionMessages(anchorMessages, actionMessages) {
+    const replacements = new Set(actionMessages.filter(actionMessage => {
+      const contained = anchorMessages.filter(anchorMessage => actionMessage.node.contains(anchorMessage.node));
+      if (contained.length !== 1) return false;
+      const anchor = contained[0];
+      if (anchor.role === 'user' || actionMessage.node.querySelector('[data-message-author-role="user"], [data-turn="user"]')) return false;
+      return actionMessage.text.length > anchor.text.length + 12
+        && !!actionMessage.node.querySelector('p, .prose, .markdown, pre, table');
+    }));
+    const retainedAnchors = anchorMessages.filter(anchorMessage => ![...replacements].some(actionMessage =>
+      actionMessage.node.contains(anchorMessage.node)));
+    const uncovered = actionMessages.filter(actionMessage => !retainedAnchors.some(anchorMessage =>
+      anchorMessage.node.contains(actionMessage.node) || actionMessage.node.contains(anchorMessage.node)));
+    return dedupeMessages([...retainedAnchors, ...uncovered].sort((left, right) => {
+      const relation = left.node.compareDocumentPosition(right.node);
+      return relation & 4 ? -1 : relation & 2 ? 1 : 0;
+    }));
+  }
+
+  function expandThinkingMessageNode(node) {
+    if (inferRole(node) !== 'assistant' || node.querySelector('.prose, .markdown')) return node;
+    if (!/^(?:思考了|思考中|Thinking|Thought for)/i.test(normalizeWhitespace(node.textContent || ''))) return node;
+    const main = document.querySelector('main');
+    let expanded = node;
+    for (let parent = node.parentElement; parent && parent !== main; parent = parent.parentElement) {
+      if (parent.querySelector('[data-message-author-role="user"], [data-turn="user"]')
+        || [...parent.querySelectorAll('.whitespace-pre-wrap')].some(bubble => !bubble.closest('.prose, .markdown'))) break;
+      if (parent.querySelector('.prose, .markdown')) expanded = parent;
+    }
+    return expanded;
+  }
+
+  function dedupeMessages(messages) {
+    const seenNodes = new Set();
+    const identityOccurrences = new Map();
+    return messages
+      .filter(message => {
+        if (seenNodes.has(message.node)) return false;
+        seenNodes.add(message.node);
+        return true;
+      })
+      .map(message => {
+        const identity = message.identity || message.signature;
+        const occurrence = identityOccurrences.get(identity) || 0;
+        identityOccurrences.set(identity, occurrence + 1);
+        return { ...message, identity, signature: `${identity}|${occurrence}` };
+      });
+  }
+
+  function findMessageNodesFromActions(completeAnchors = []) {
     const main = document.querySelector('main');
     if (!main) return [];
-    const buttons = [...main.querySelectorAll('button[data-testid*="copy-turn"], button[aria-label^="复制"], button[aria-label^="Copy"], button[title^="复制"]')];
+    const buttons = [...main.querySelectorAll([
+      '[data-testid*="copy-turn" i]',
+      '[data-testid*="copy-response" i]',
+      'button[aria-label="复制"]',
+      'button[aria-label="Copy" i]',
+      'button[title="复制"]',
+      'button[title="Copy" i]'
+    ].join(','))];
     const nodes = [];
+    const completeAnchorSet = new Set(completeAnchors);
     for (const button of buttons) {
-      if (button.closest('pre, code, form, nav, aside, header, footer, #cgh-panel')) continue;
+      let covered = false;
+      for (let parent = button; parent && parent !== main; parent = parent.parentElement) {
+        if (completeAnchorSet.has(parent)) {
+          covered = true;
+          break;
+        }
+      }
+      if (covered) continue;
+      if (button.closest('pre, code, form, nav, aside, header, footer, #cgh-panel, [data-testid*="code-block" i], [class*="code-block"]')) continue;
       for (let node = button.parentElement; node && node !== main; node = node.parentElement) {
+        const hasBody = node.querySelector('.prose, .markdown, .whitespace-pre-wrap, [data-message-author-role]');
+        if (!hasBody && node.parentElement !== main) continue;
         const clone = node.cloneNode(true);
         clone.querySelectorAll('button, [role="button"], [role="tooltip"], .sr-only, svg').forEach(item => item.remove());
         if (normalizeWhitespace(clone.textContent || '').length >= 2) {
+          if (button.matches('[data-testid*="copy-response" i]')) inferredMessageRoles.set(node, 'assistant');
           nodes.push(node);
           break;
         }
@@ -325,7 +613,18 @@
       const answer = following.find(sibling => {
         if (!node.contains(sibling) && sibling.querySelector('.whitespace-pre-wrap')) return false;
         const clone = sibling.cloneNode(true);
-        clone.querySelectorAll('button, [role="button"], [role="tooltip"], .sr-only, svg').forEach(item => item.remove());
+        clone.querySelectorAll([
+          'button',
+          '[role="button"]',
+          '[role="tooltip"]',
+          '.sr-only',
+          'svg',
+          '[data-testid*="copy" i]',
+          '[aria-label*="复制" i]',
+          '[aria-label*="copy" i]',
+          '[title*="复制" i]',
+          '[title*="copy" i]'
+        ].join(',')).forEach(item => item.remove());
         const text = normalizeWhitespace(clone.textContent || '');
         return text.length >= 2 && (text.length >= 10 || sibling.matches('p, article')
           || sibling.querySelector('p, h1, h2, h3, h4, h5, h6, pre, blockquote, .katex, mjx-container'));
@@ -337,6 +636,13 @@
       }
     }
     return [node];
+  }
+
+  function findExportMessageBodies() {
+    const main = document.querySelector('main');
+    if (!main) return [];
+    return dedupeNodes([...main.querySelectorAll('.prose, .markdown, .whitespace-pre-wrap')]
+      .filter(node => !node.closest('form, nav, aside, header, footer, button, [contenteditable="true"]')));
   }
 
   function findGenericMessageNodes() {
@@ -366,7 +672,9 @@
   function inferRole(node) {
     const inferred = inferredMessageRoles.get(node);
     if (inferred) return inferred;
-    const roleNode = node.closest('[data-turn], [data-message-author-role]') || node;
+    const roleNode = node.closest('[data-turn], [data-message-author-role]')
+      || node.querySelector('[data-turn], [data-message-author-role]')
+      || node;
     const role = roleNode.getAttribute('data-turn') || roleNode.getAttribute('data-message-author-role');
     return role === 'user' || role === 'assistant' ? role : 'unknown';
   }
@@ -423,7 +731,8 @@ ${text}\n\
   function handleExportSelectionPointerOver(event) {
     if (!exportSelectionMode || !(event.target instanceof Element)) return;
     if (event.target.closest('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback')) return;
-    const message = currentMessages.find(item => item.node === event.target || item.node.contains(event.target));
+    const message = currentMessages.find(item => (item.contentNodes || [item.node])
+      .some(node => node === event.target || node.contains(event.target)));
     if (!message || selectedMessageSignatures.has(message.signature)) {
       clearHoveredMessageOutline();
       return;
@@ -431,14 +740,15 @@ ${text}\n\
     if (!hoveredMessageOutline) hoveredMessageOutline = createMessageOutline('cgh-hover-outline');
     if (hoveredMessageOutline.node === message.node) return;
     hoveredMessageOutline.node = message.node;
+    hoveredMessageOutline.nodes = message.outlineNodes || message.contentNodes;
     ensureMessageOutlineTracking();
     scheduleMessageOutlineUpdate();
   }
 
   function handleExportSelectionPointerOut(event) {
     if (!hoveredMessageOutline || !(event.target instanceof Element)) return;
-    const node = hoveredMessageOutline.node;
-    if (event.relatedTarget instanceof Element && node?.contains(event.relatedTarget)) return;
+    const nodes = hoveredMessageOutline.nodes || [hoveredMessageOutline.node];
+    if (event.relatedTarget instanceof Element && nodes.some(node => node?.contains(event.relatedTarget))) return;
     clearHoveredMessageOutline();
   }
 
@@ -456,7 +766,8 @@ ${text}\n\
       return;
     }
 
-    const messageIndex = currentMessages.findIndex(message => message.node === target || message.node.contains(target));
+    const messageIndex = currentMessages.findIndex(message => (message.contentNodes || [message.node])
+      .some(node => node === target || node.contains(target)));
     if (messageIndex < 0) return;
 
     event.preventDefault();
@@ -469,6 +780,7 @@ ${text}\n\
       syncConversationState();
       currentMessages = collectMessages();
       syncSelectedMessagesWithCurrent();
+      renderMessageList();
     }
 
     exportSelectionMode = enabled;
@@ -512,8 +824,25 @@ ${text}\n\
     return currentMessages.filter(message => selectedMessageSignatures.has(message.signature));
   }
 
+  function renderMessageList() {
+    if (!messageList) return;
+    const key = currentMessages.map(message => message.signature).join('\u0000');
+    if (key === renderedMessageListKey) return;
+    const scrollTop = messageList.scrollTop;
+    messageList.innerHTML = currentMessages.map((message, index) => {
+      const role = message.role === 'user' ? '你' : message.role === 'assistant' ? 'GPT' : '内容';
+      const preview = ((message.previewText || message.text).replace(/\s+/g, ' ').trim() || '[图片]').slice(0, 96);
+      return `<button type="button" class="cgh-item" data-action="select-listed-message" data-message-index="${index}" aria-pressed="false">
+        <span class="cgh-role">${role}</span><span class="cgh-preview">${escapeHtml(`${index + 1}. ${preview}`)}</span>
+      </button>`;
+    }).join('') || '<div class="cgh-empty">当前对话暂无消息</div>';
+    messageList.scrollTop = scrollTop;
+    renderedMessageListKey = key;
+  }
+
   function updateExportUi() {
     updateSelectedMessageClasses();
+    updateMessageListSelectionState();
 
     if (!panel) return;
 
@@ -545,13 +874,25 @@ ${text}\n\
     }
   }
 
+  function updateMessageListSelectionState() {
+    if (!messageList) return;
+    for (const button of messageList.querySelectorAll('[data-message-index]')) {
+      const message = currentMessages[Number(button.dataset.messageIndex)];
+      const selected = !!message && selectedMessageSignatures.has(message.signature);
+      button.classList.toggle('cgh-item-selected', selected);
+      button.setAttribute('aria-pressed', String(selected));
+    }
+  }
+
   function updateSelectedMessageClasses() {
     const selected = new Set();
     for (const message of currentMessages) {
       if (!(message.node instanceof HTMLElement)) continue;
       const isSelected = selectedMessageSignatures.has(message.signature);
-      message.node.classList.toggle('cgh-export-selected', isSelected);
-      message.node.classList.toggle('cgh-export-selectable', exportSelectionMode);
+      for (const node of message.contentNodes || [message.node]) {
+        node.classList.toggle('cgh-export-selected', isSelected);
+        node.classList.toggle('cgh-export-selectable', exportSelectionMode);
+      }
       if (isSelected) {
         selected.add(message.signature);
         let outline = selectedMessageOutlines.get(message.signature);
@@ -560,6 +901,7 @@ ${text}\n\
           selectedMessageOutlines.set(message.signature, outline);
         }
         outline.node = message.node;
+        outline.nodes = message.outlineNodes || message.contentNodes;
       }
     }
     for (const [signature, outline] of selectedMessageOutlines) {
@@ -578,6 +920,7 @@ ${text}\n\
 
     currentMessages = collectMessages();
     syncSelectedMessagesWithCurrent();
+    renderMessageList();
     const selectedMessages = getSelectedMessages();
     if (!selectedMessages.length) {
       showToast('请先选择消息');
@@ -614,7 +957,7 @@ ${text}\n\
         dataUrls = await renderElementToPngParts(container);
       } catch (primaryError) {
         console.warn('[CGH] DOM PNG export failed, using canvas fallback', primaryError);
-        if (selectedMessages.some(message => hasExportableImages(message.node))) {
+        if (selectedMessages.some(message => (message.contentNodes || [message.node]).some(hasExportableImages))) {
           throw new Error('图片导出被浏览器限制，请尝试重新打开页面后再导出');
         }
         dataUrls = [renderMessagesToCanvasPng(selectedMessages)];
@@ -641,16 +984,24 @@ ${text}\n\
   function buildMessagesMarkdown(messages) {
     const sections = messages.map((message, index) => {
       const role = message.role === 'user' ? '用户' : message.role === 'assistant' ? 'ChatGPT' : '内容';
-      const contentRoot = findMessageContentNode(message.node) || message.node;
+      const contentRoot = getMessageMarkdownRoot(message);
       const content = domToMarkdown(contentRoot).trim() || message.text.trim();
       return `## ${index + 1}. ${role}\n\n${content}`;
     });
     return `# ChatGPT 对话摘录\n\n> 导出时间：${formatExportDate(new Date())}\n\n${sections.join('\n\n---\n\n')}\n`;
   }
 
+  function getMessageMarkdownRoot(message) {
+    const nodes = message.contentNodes || [message.node];
+    if (nodes.length === 1) return findMessageContentNode(nodes[0]) || nodes[0];
+    const root = document.createElement('div');
+    for (const node of nodes) root.appendChild((findMessageContentNode(node) || node).cloneNode(true));
+    return root;
+  }
+
   function domToMarkdown(root) {
     const clone = root.cloneNode(true);
-    clone.querySelectorAll('button, script, style, svg, #cgh-panel, #cgh-toast').forEach(node => node.remove());
+    clone.querySelectorAll('button, script, style, svg, .sr-only, #cgh-panel, #cgh-toast').forEach(node => node.remove());
     clone.querySelectorAll(FORMULA_SELECTORS).forEach((formula) => {
       if (!formula.parentNode || formula.parentElement?.closest(FORMULA_SELECTORS)) return;
       const latex = extractLatexFromNode(formula);
@@ -829,20 +1180,59 @@ ${text}\n\
       contentWrap.className = 'cgh-print-content';
       const content = message.role === 'user'
         ? buildUserExportContent(message)
-        : extractExportContent(message.node);
-      if (content.childNodes.length) {
+        : extractMessageExportContent(message);
+      if (content.childNodes.length || content.matches?.('img')) {
         contentWrap.appendChild(content);
       } else {
         const paragraph = document.createElement('p');
         paragraph.textContent = message.text || `第 ${index + 1} 条消息`;
         contentWrap.appendChild(paragraph);
       }
+      normalizePrintCodeBlocks(contentWrap);
 
       section.appendChild(contentWrap);
       container.appendChild(section);
     }
 
     return container;
+  }
+
+  function normalizePrintCodeBlocks(root) {
+    for (const pre of [...root.querySelectorAll('pre')]) {
+      let shell = pre;
+      let label = '';
+      for (let parent = pre.parentElement, depth = 0; parent && parent !== root && depth < 4; parent = parent.parentElement, depth += 1) {
+        if (parent.querySelectorAll('pre').length !== 1
+          || parent.querySelector('p, h1, h2, h3, h4, h5, h6, ul, ol, table, blockquote, img')) break;
+        const children = [...parent.children];
+        const branchIndex = children.findIndex(child => child === pre || child.contains(pre));
+        const hasFollowingText = children.slice(branchIndex + 1).some(child => {
+          const clone = child.cloneNode(true);
+          clone.querySelectorAll('button, [role="button"], svg').forEach(item => item.remove());
+          return !!normalizeWhitespace(clone.textContent || '');
+        });
+        if (hasFollowingText) break;
+        const clone = parent.cloneNode(true);
+        clone.querySelectorAll('pre, button, [role="button"], svg').forEach(item => item.remove());
+        const headerText = normalizeWhitespace(clone.textContent || '').replace(/^<\/>\s*/, '');
+        if (headerText.length > 24) break;
+        shell = parent;
+        if (headerText) {
+          label = headerText;
+          break;
+        }
+      }
+      const code = pre.querySelector('code');
+      const language = [...(code?.classList || [])].find(name => name.startsWith('language-'))?.slice(9) || '';
+      const card = document.createElement('div');
+      card.className = 'cgh-print-code-card';
+      const header = document.createElement('div');
+      header.className = 'cgh-print-code-label';
+      header.textContent = label || language || '代码';
+      shell.replaceWith(card);
+      card.appendChild(header);
+      card.appendChild(pre);
+    }
   }
 
   function buildPrintPdfHtml(contentHtml, title) {
@@ -1080,12 +1470,59 @@ ${text}\n\
         page-break-inside: avoid;
       }
 
+      .cgh-print-content .cgh-print-code-card {
+        margin: 11pt 0 14pt;
+        border: 0.8pt solid #4b5563;
+        border-radius: 7pt;
+        background: #191b1f;
+        break-inside: auto;
+        page-break-inside: auto;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
+      .cgh-print-content .cgh-print-code-label {
+        display: block;
+        margin: 0;
+        padding: 6pt 11pt;
+        border-bottom: 0.75pt solid #3f454f;
+        color: #d1d5db !important;
+        background: #24272c;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+        font-size: 9pt;
+        font-weight: 700;
+        line-height: 1.35;
+        break-after: avoid;
+        page-break-after: avoid;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
+      .cgh-print-content .cgh-print-code-card pre {
+        margin: 0 !important;
+        padding: 10pt 11pt !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        color: #f4f4f5 !important;
+        background: #191b1f !important;
+        font-size: 10.5pt;
+        line-height: 1.55;
+        break-inside: auto;
+        page-break-inside: auto;
+      }
+
       .cgh-print-content code,
       .cgh-print-content .cgh-export-code {
         color: #f4f4f5;
         font-family: Consolas, "Courier New", monospace;
         font-size: 9.8pt;
         background: transparent;
+      }
+
+      .cgh-print-content .cgh-print-code-card pre code,
+      .cgh-print-content .cgh-print-code-card pre code span {
+        font-size: inherit !important;
+        line-height: inherit !important;
       }
 
       .cgh-print-content .cgh-export-syntax-token {
@@ -1394,8 +1831,8 @@ ${text}\n\
 
     const content = message.role === 'user'
       ? buildUserExportContent(message)
-      : extractExportContent(message.node);
-    if (content.childNodes.length) {
+      : extractMessageExportContent(message);
+    if (content.childNodes.length || content.matches?.('img')) {
       bubble.appendChild(content);
     } else {
       bubble.textContent = message.text || `第 ${index + 1} 条消息`;
@@ -1451,7 +1888,8 @@ ${text}\n\
 
   function collectExportableImages(root) {
     if (!(root instanceof Element)) return [];
-    return [...root.querySelectorAll('img')].filter((img) => {
+    const images = root.matches('img') ? [root, ...root.querySelectorAll('img')] : [...root.querySelectorAll('img')];
+    return images.filter((img) => {
       if (!(img instanceof HTMLImageElement)) return false;
       if (img.closest('#cgh-panel, #cgh-toast, #cgh-formula-copy-feedback')) return false;
       const src = img.currentSrc || img.src || '';
@@ -1479,6 +1917,7 @@ ${text}\n\
       '#cgh-toast',
       '#cgh-formula-copy-feedback',
       '.cgh-export-selection-badge',
+      '.sr-only',
       'button',
       '[role="button"]',
       '[data-testid*="copy"]',
@@ -1489,6 +1928,14 @@ ${text}\n\
     stripInlineInteractionAttributes(clone);
     normalizeExportContent(clone);
     return clone;
+  }
+
+  function extractMessageExportContent(message) {
+    const nodes = message.contentNodes || [message.node];
+    if (nodes.length === 1) return extractExportContent(nodes[0]);
+    const container = document.createElement('div');
+    for (const node of nodes) container.appendChild(extractExportContent(node));
+    return container;
   }
 
   function preserveCodeSyntaxStyles(source, clone, styleResolver = null) {
@@ -1537,9 +1984,15 @@ ${text}\n\
     const candidates = [
       '[data-message-author-role] [data-message-id]',
       '[data-message-author-role] .markdown',
+      '[data-message-author-role] .prose',
+      '[data-markdown-text-style="assistant-message"]',
+      '[class*="MarkdownRoot"]',
       '.markdown',
+      '.prose',
       '[data-testid="conversation-turn"] .markdown',
+      '[data-testid="conversation-turn"] .prose',
       '[class*="markdown"]',
+      '[class*="prose"]',
     ];
 
     const getContentText = (element) => {
@@ -1549,6 +2002,7 @@ ${text}\n\
         '[role="button"]',
         '[data-testid*="copy"]',
         '[data-testid*="turn-action"]',
+        '.sr-only',
         '#cgh-panel',
         '#cgh-toast',
       ].join(',')).forEach((child) => child.remove());
@@ -1573,7 +2027,10 @@ ${text}\n\
     // A turn can contain several markdown fragments. Exporting just the longest
     // fragment would silently drop the rest, so use the complete message when
     // no single candidate covers nearly all of its readable text.
-    if (bestCandidate && bestCandidate.text.length / sourceText.length >= 0.8) {
+    const outsideContent = bestCandidate && [...node.querySelectorAll('p, h1, h2, h3, h4, h5, h6, pre, table, ul, ol, blockquote, img')]
+      .some(element => !bestCandidate.candidate.contains(element)
+        && !element.closest('button, [role="button"], .sr-only, model-thoughts, .thoughts-container, .thoughts-content'));
+    if (bestCandidate && bestCandidate.text.length / sourceText.length >= 0.8 && !outsideContent) {
       return bestCandidate.candidate;
     }
 
@@ -2361,6 +2818,8 @@ ${text}\n\
       node.getAttribute?.('data-message-id'),
       node.getAttribute?.('data-testid'),
       node.id,
+      node.closest?.('[data-message-id]')?.getAttribute?.('data-message-id'),
+      node.closest?.('[data-testid^="conversation-turn"]')?.getAttribute?.('data-testid'),
     ].find(Boolean) || '';
 
     return `${role}|${stableId}|${text.length}|${hashText(text)}`;
@@ -2387,7 +2846,7 @@ ${text}\n\
     element.className = `cgh-message-outline ${kind}`;
     element.setAttribute('aria-hidden', 'true');
     element.hidden = true;
-    return { node: null, anchor: null, element };
+    return { node: null, nodes: null, anchor: null, element };
   }
 
   function removeMessageOutline(outline) {
@@ -2455,6 +2914,7 @@ ${text}\n\
   function getMessageOutlineRect(node) {
     if (!node?.isConnected) return null;
     const own = node.getBoundingClientRect();
+    if (node.hasAttribute('data-content-search-unit-key') && own.width > 1 && own.height > 1) return own;
     let left = own.width > 1 && own.height > 1 ? own.left : Infinity;
     let top = own.width > 1 && own.height > 1 ? own.top : Infinity;
     let right = own.width > 1 && own.height > 1 ? own.right : -Infinity;
@@ -2480,14 +2940,23 @@ ${text}\n\
   }
 
   function positionMessageOutline(outline) {
-    const rect = getMessageOutlineRect(outline.node);
+    const nodes = outline.nodes?.length ? outline.nodes : [outline.node];
+    const rects = nodes.map(getMessageOutlineRect).filter(Boolean);
+    const rect = rects.length ? {
+      left: Math.min(...rects.map(item => item.left)),
+      top: Math.min(...rects.map(item => item.top)),
+      right: Math.max(...rects.map(item => item.right)),
+      bottom: Math.max(...rects.map(item => item.bottom)),
+    } : null;
     if (!rect || rect.right - rect.left < 4 || rect.bottom - rect.top < 4) {
       outline.element.hidden = true;
       outline.element.remove();
       setMessageOutlineAnchor(outline, null);
       return;
     }
-    const anchor = getMessageOutlineAnchor(outline.node);
+    let anchor = nodes.length > 1 ? nodes[0].parentElement : null;
+    while (anchor && !nodes.every(node => anchor.contains(node))) anchor = anchor.parentElement;
+    anchor ||= getMessageOutlineAnchor(outline.node);
     setMessageOutlineAnchor(outline, anchor);
     if (!outline.element.isConnected) anchor.appendChild(outline.element);
     const anchorRect = anchor.getBoundingClientRect();
@@ -2583,7 +3052,7 @@ ${text}\n\
     const roleNodes = [...document.querySelectorAll('[data-message-author-role]')];
     const messageIds = [...document.querySelectorAll('[data-message-id]')];
     const legacyTurns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
-    const actionNodes = findMessageNodesFromActions();
+    let actionNodes = [];
     const main = document.querySelector('main');
     const route = /(?:^|\/)c\/[^/]+/.test(location.pathname) ? 'conversation' : location.pathname === '/' ? 'home' : 'other';
     const selectContent = node => node.querySelector('.markdown, .prose, [class*="markdown"]') || node;
@@ -2603,6 +3072,7 @@ ${text}\n\
     }
     if (!contentNodes.length) {
       source = 'copy actions';
+      actionNodes = findMessageNodesFromActions();
       const extraTextNodes = findGenericMessageNodes().filter(node => !actionNodes.some(action => action.contains(node)));
       contentNodes = dedupeNodes([...actionNodes, ...extraTextNodes]).filter(node => node.textContent.trim());
       if (!actionNodes.length) source = 'main text';
@@ -2778,7 +3248,17 @@ ${text}\n\
 
   function startDraftSave() {
     attachDraftInput();
-    draftObserver = new MutationObserver(() => attachDraftInput());
+    draftObserver = new MutationObserver((mutations) => {
+      if (draftInput?.isConnected) return;
+      if (draftInput) {
+        attachDraftInput();
+        return;
+      }
+      if (mutations.some(mutation => [...mutation.addedNodes].some(node =>
+        node instanceof Element && (node.matches(COMPOSER_SELECTORS) || node.querySelector(COMPOSER_SELECTORS))))) {
+        attachDraftInput();
+      }
+    });
     draftObserver.observe(document.body, { childList: true, subtree: true });
     window.addEventListener('beforeunload', saveDraftNow);
     document.addEventListener('keydown', handleDraftSendKey, true);
@@ -2804,6 +3284,7 @@ ${text}\n\
   }
 
   function attachDraftInput() {
+    if (draftInput?.isConnected && draftInput.getBoundingClientRect().width > 0) return;
     const input = findComposer();
     if (!input || input === draftInput) return;
     draftInput?.removeEventListener('input', scheduleDraftSave);
